@@ -1,0 +1,35 @@
+// Inline SVG icons; every icon carries explicit width/height so it never inflates to its container.
+const P = { fill: 'none', stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round' as const, strokeLinejoin: 'round' as const };
+type I = { size?: number };
+const svg = (d: React.ReactNode, size = 16) => <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" focusable="false">{d}</svg>;
+
+export const IPlay = ({ size }: I) => svg(<path d="M7 5l12 7-12 7z" fill="currentColor" />, size);
+export const IPause = ({ size }: I) => svg(<g fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1" /><rect x="14" y="5" width="4" height="14" rx="1" /></g>, size);
+export const IStop = ({ size }: I) => svg(<rect x="6" y="6" width="12" height="12" rx="1.5" fill="currentColor" />, size);
+export const IRewind = ({ size }: I) => svg(<g {...P}><path d="M6 5v14" /><path d="M19 6l-9 6 9 6z" fill="currentColor" /></g>, size);
+export const ILoop = ({ size }: I) => svg(<g {...P}><path d="M4 12a6 6 0 0 1 6-6h8" /><path d="M15 3l3 3-3 3" /><path d="M20 12a6 6 0 0 1-6 6H6" /><path d="M9 21l-3-3 3-3" /></g>, size);
+export const IMetro = ({ size }: I) => svg(<g {...P}><path d="M8 21h8l-3-17h-2z" /><path d="M12 14l5-6" /></g>, size);
+export const IRec = ({ size }: I) => svg(<circle cx="12" cy="12" r="6" fill="currentColor" />, size);
+export const IUndo = ({ size }: I) => svg(<g {...P}><path d="M9 14L4 9l5-5" /><path d="M4 9h10a6 6 0 0 1 0 12h-3" /></g>, size);
+export const IRedo = ({ size }: I) => svg(<g {...P}><path d="M15 14l5-5-5-5" /><path d="M20 9H10a6 6 0 0 0 0 12h3" /></g>, size);
+export const IPencil = ({ size }: I) => svg(<g {...P}><path d="M4 20l4-1 11-11-3-3L5 16z" /></g>, size);
+export const ILine = ({ size }: I) => svg(<g {...P}><path d="M5 19L19 5" /></g>, size);
+export const ICurve = ({ size }: I) => svg(<g {...P}><path d="M4 18C8 4 16 20 20 6" /></g>, size);
+export const IDot = ({ size }: I) => svg(<circle cx="12" cy="12" r="3.5" fill="currentColor" />, size);
+export const IRect = ({ size }: I) => svg(<g {...P}><rect x="5" y="6" width="14" height="12" rx="1" /></g>, size);
+export const IEllipse = ({ size }: I) => svg(<g {...P}><ellipse cx="12" cy="12" rx="8" ry="6" /></g>, size);
+export const IEraser = ({ size }: I) => svg(<g {...P}><path d="M7 20h12" /><path d="M4 15l9-9 6 6-7 7H8z" /></g>, size);
+export const ISelect = ({ size }: I) => svg(<g {...P}><path d="M5 4l13 7-6 1.5L9.5 19z" /></g>, size);
+export const IHand = ({ size }: I) => svg(<g {...P}><path d="M8 12V6a1.5 1.5 0 0 1 3 0v5M11 11V4.5a1.5 1.5 0 0 1 3 0V11M14 11V6a1.5 1.5 0 0 1 3 0v8a6 6 0 0 1-6 6h-1a6 6 0 0 1-5-3l-2-4a1.5 1.5 0 0 1 2.5-1.5L8 14" /></g>, size);
+export const IImage = ({ size }: I) => svg(<g {...P}><rect x="3" y="5" width="18" height="14" rx="2" /><circle cx="9" cy="10" r="1.8" /><path d="M21 16l-5-5-8 8" /></g>, size);
+export const IFolder = ({ size }: I) => svg(<g {...P}><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /></g>, size);
+export const ISave = ({ size }: I) => svg(<g {...P}><path d="M5 4h11l3 3v13H5z" /><path d="M8 4v5h7V4" /><rect x="8" y="13" width="8" height="5" /></g>, size);
+export const INew = ({ size }: I) => svg(<g {...P}><path d="M6 3h8l4 4v14H6z" /><path d="M12 10v6M9 13h6" /></g>, size);
+export const IExport = ({ size }: I) => svg(<g {...P}><path d="M12 15V3" /><path d="M7 8l5-5 5 5" /><path d="M5 15v5h14v-5" /></g>, size);
+export const IHelp = ({ size }: I) => svg(<g {...P}><circle cx="12" cy="12" r="9" /><path d="M9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.7.3-1 .9-1 1.7" /><circle cx="12" cy="17" r="0.6" fill="currentColor" /></g>, size);
+export const IPanel = ({ size }: I) => svg(<g {...P}><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M9 4v16" /></g>, size);
+export const IDice = ({ size }: I) => svg(<g {...P}><rect x="4" y="4" width="16" height="16" rx="3" /><circle cx="9" cy="9" r="1" fill="currentColor" /><circle cx="15" cy="15" r="1" fill="currentColor" /><circle cx="15" cy="9" r="1" fill="currentColor" /><circle cx="9" cy="15" r="1" fill="currentColor" /></g>, size);
+export const ITrash = ({ size }: I) => svg(<g {...P}><path d="M4 7h16" /><path d="M9 7V4h6v3" /><path d="M6 7l1 13h10l1-13" /></g>, size);
+export const IPlus = ({ size }: I) => svg(<g {...P}><path d="M12 5v14M5 12h14" /></g>, size);
+export const ILock = ({ size }: I) => svg(<g {...P}><rect x="5" y="11" width="14" height="9" rx="2" /><path d="M8 11V8a4 4 0 0 1 8 0v3" /></g>, size);
+export const IChevron = ({ size }: I) => svg(<g {...P}><path d="M6 9l6 6 6-6" /></g>, size);
