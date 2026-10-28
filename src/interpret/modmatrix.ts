@@ -17,6 +17,18 @@ export const MOD_TARGETS: { id: ModTarget; label: string; needs?: string }[] = [
   { id: 'chorusDepth', label: 'Chorus depth', needs: 'chorus' },
   { id: 'crush', label: 'Bitcrush amount', needs: 'bitcrusher' },
   { id: 'sweepDepth', label: 'Atmospheric sweep mix', needs: 'atmospheric sweep' },
+  { id: 'resonance', label: 'Resonance' },
+  { id: 'richness', label: 'Harmonic richness (tilt)' },
+  { id: 'morph', label: 'Wave morph', needs: 'Image Synth' },
+  { id: 'detune', label: 'Oscillator detune', needs: 'Image Synth' },
+  { id: 'fmDepth', label: 'FM depth', needs: 'Image Synth' },
+  { id: 'noise', label: 'Noise content', needs: 'Image Synth' },
+  { id: 'lfoRate', label: 'LFO rate', needs: 'Image Synth' },
+  { id: 'lfoDepth', label: 'LFO depth', needs: 'Image Synth' },
+  { id: 'tremolo', label: 'Tremolo', needs: 'Image Synth' },
+  { id: 'attack', label: 'Attack (per note)' },
+  { id: 'release', label: 'Release (per note)' },
+  { id: 'fmRatio', label: 'FM ratio (per note)', needs: 'Image Synth' },
 ];
 
 export const FEATURE_KEYS: { id: FeatureKey; label: string }[] = [
@@ -28,6 +40,8 @@ export const FEATURE_KEYS: { id: FeatureKey; label: string }[] = [
   { id: 'texture', label: 'Texture density' },
   { id: 'variation', label: 'Visual change' },
   { id: 'centroid', label: 'Vertical brightness position' },
+  { id: 'orientation', label: 'Edge orientation (vertical)' },
+  { id: 'periodicity', label: 'Visual periodicity' },
 ];
 
 export function bakeRoute(route: ModRoute, cv: Curve, beats: number): AutomationLane {

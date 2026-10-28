@@ -192,8 +192,10 @@ try {
     for (const mode of ['contour', 'color', 'atmos']) {
       await S((mode) => window.__aperture.store.getState().setImageSettings({ mode }, true), mode);
       await sleep(500);
-      const n = await S(() => window.__aperture.store.getState().project.tracks.filter((t) => t.generator?.startsWith('image:')).map((t) => t.name));
-      check(`image mode “${mode}” generates its own layers`, n.length >= 1, n.join(', '));
+      const n = await S(() => window.__aperture.store.getState().project.tracks.filter((t) => t.generator?.startsWith('image:')).map((t) => `${t.name}:${t.notes.length}`));
+      // the dark uniform frame has no contours: contour mode must stay silent instead of inventing notes
+      if (mode === 'contour') check('contour mode on a featureless image produces no contour notes', n.every((x) => !x.startsWith('Contour') || x.endsWith(':0')), n.join(', ') || 'no layers');
+      else check(`image mode “${mode}” generates its own layers`, n.length >= 1, n.join(', '));
     }
     await page.screenshot({ path: `${OUT}image-atmos.png` });
     // the analysis cache: changing sound never re-analyses

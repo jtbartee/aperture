@@ -44,11 +44,23 @@ export interface NoteEvent {
   degree?: number;
   strokeId?: string;
   locked?: boolean;
+  /** continuous pitch: [beats after onset, semitones relative to midi] — glides along a contour */
+  bend?: [number, number][];
+  /** 0..1 per-note timbre (contour thickness → harmonic richness); used by the Image Synth */
+  timbre?: number;
+  /** normalised source-image position (x, y bottom-up) the note was read from */
+  src?: [number, number];
+  /** id of the contour the note came from */
+  cid?: string;
 }
 
 export type ModTarget =
   | 'cutoff' | 'volume' | 'pan' | 'reverbSend' | 'delaySend'
-  | 'drive' | 'delayFeedback' | 'tremoloRate' | 'chorusDepth' | 'crush' | 'sweepDepth';
+  | 'drive' | 'delayFeedback' | 'tremoloRate' | 'chorusDepth' | 'crush' | 'sweepDepth'
+  // channel-level synthesis buses (modulate sustained voices)
+  | 'resonance' | 'richness' | 'morph' | 'detune' | 'fmDepth' | 'noise' | 'lfoRate' | 'lfoDepth' | 'tremolo'
+  // read per note at its onset
+  | 'attack' | 'release' | 'fmRatio';
 
 export interface AutomationPoint { beat: Beats; value: number }
 
@@ -62,7 +74,23 @@ export interface AutomationLane {
 
 // ---------------------------------------------------------------- synthesis
 
-export type Engine = 'sub' | 'fm' | 'modal' | 'noise' | 'glitch' | 'drums';
+export type Engine = 'sub' | 'fm' | 'modal' | 'noise' | 'glitch' | 'drums' | 'image';
+
+/** Image Synth: two wavetables read from the picture, morphed, plus FM, noise and an LFO that
+ *  drives filter wobble and tremolo. Every value here is the static base; lanes move them live. */
+export interface ImageSynthParams {
+  /** harmonic amplitudes 1..N of wavetable A (smooth / luminance-derived) and B (detail-derived) */
+  wavesA: number[];
+  wavesB: number[];
+  morph: number; // 0..1 A→B
+  detune: number; // cents between the two tables
+  fmRatio: number;
+  fmDepth: number; // modulation index 0..4
+  noise: number; // 0..0.5
+  lfoRate: number; // Hz
+  lfoDepth: number; // 0..1 filter wobble
+  tremolo: number; // 0..1
+}
 export type Wave = 'sine' | 'triangle' | 'sawtooth' | 'square';
 export type FilterType = 'lowpass' | 'highpass' | 'bandpass' | 'notch';
 export type LfoDest = 'none' | 'pitch' | 'filter' | 'amp' | 'pan';
@@ -94,6 +122,8 @@ export interface SynthPatch {
   /** dB trim */
   gain: number;
   drums: Record<DrumVoice, DrumVoiceParams>;
+  /** engine 'image' only */
+  image?: ImageSynthParams;
 }
 
 export type FxType =
@@ -199,23 +229,76 @@ export interface ImageAssetRef {
 }
 
 export type ImageMode = 'contour' | 'color' | 'atmos' | 'hybrid';
-export type FeatureKey = 'brightness' | 'saturation' | 'hue' | 'contrast' | 'edges' | 'texture' | 'variation' | 'centroid' | 'none';
+export type FeatureKey = 'brightness' | 'saturation' | 'hue' | 'contrast' | 'edges' | 'texture' | 'variation' | 'centroid' | 'orientation' | 'periodicity' | 'none';
 
-export interface ImageSettings {
+export type ContourPreset = 'photo' | 'lineart' | 'abstract' | 'panorama' | 'custom';
+
+/** Contour extraction controls (src/analysis/contours.ts). Lengths are in analysis pixels. */
+export interface ContourSettings {
+  preset: ContourPreset;
+  /** 0..1: share of edge pixels the hysteresis keeps (1 = most edges) */
+  sensitivity: number;
+  /** 0..1: absolute contrast an edge must reach to start a contour — a uniform image stays empty */
+  minStrength: number;
+  minLength: number;
+  /** 0..1: simplification tolerance; 1 keeps every visible bend */
+  detail: number;
+  /** 0..1: geometric smoothing of the traced path */
+  smoothing: number;
+  /** 0..1: how strongly corners resist smoothing and simplification */
+  curvature: number;
+  /** 0..1: 0 merges near-parallel edges and bridges gaps; 1 keeps every edge apart and splits at sharp corners */
+  separation: number;
+  /** 0..1: 0 prunes side branches into their stems; 1 keeps every branch as its own contour */
+  branches: number;
+  maxContours: number;
+  /** 0..1: weight of the coarse scale — fine edges not supported by coarse structure are dropped */
+  multiScale: number;
+}
+
+/** How image events are placed in time. */
+export type RhythmMode = 'free' | 'texture' | 'metric';
+
+/** Image-derived synthesis targets. Audio targets become automation lanes; attack/release/fmRatio
+ *  are read per note at its onset; density is consumed by the event generators. */
+export type SynthTarget =
+  | 'cutoff' | 'resonance' | 'morph' | 'richness' | 'detune' | 'fmDepth' | 'fmRatio' | 'noise' | 'attack' | 'release'
+  | 'lfoRate' | 'lfoDepth' | 'tremolo' | 'pan' | 'delayFeedback' | 'reverbSend' | 'density';
+
+export interface SynthMapping { target: SynthTarget; source: FeatureKey; amount: number }
+
+/** Shared musical shaping controls for image and panorama sonification. */
+export interface SonifyShape {
+  /** 0..1 VISUAL FIDELITY: high disables transformations that obscure the image↔music correspondence */
+  fidelity: number;
+  /** 0..1 MUSICAL STRUCTURE: 0 unmetered / microtonal-capable, 1 key, harmony, phrasing and grid */
+  structure: number;
+  /** 0..1 EVOLUTION: 0 static timbre and harmony, 1 strong ongoing development */
+  evolution: number;
+  /** 0..1 Literal ↔ Musical contour interpretation */
+  interpretation: number;
+  /** continuous pitch: contour notes bend with the shape (microtonal below ~20% structure) */
+  glide: boolean;
+  scaleLock: boolean;
+  rhythm: RhythmMode;
+  /** 'image' = Image Synth patches derived from the picture; 'presets' = the fixed instrument presets */
+  synth: 'image' | 'presets';
+  synthMap: SynthMapping[];
+}
+
+export interface ImageSettings extends SonifyShape {
   mode: ImageMode;
   bars: number;
-  // contour
-  edgeSensitivity: number; // 0..1
-  minContour: number; // pixels
-  detail: number; // 0..1 (bucket fineness)
-  density: number; // 0..1
-  smoothing: number; // 0..1
-  grouping: number; // 0..1
+  contour: ContourSettings;
+  /** EVENT DENSITY 0..1 */
+  density: number;
+  /** 0..1 smoothing of the feature curves (colour / atmospheric modes) */
+  smoothing: number;
   // color & texture mapping: musical parameter → image feature
   mapping: Record<'pitch' | 'velocity' | 'density' | 'richness' | 'accent' | 'duration', FeatureKey>;
   /** hue sector (6 × 60°) → index into the colour tracks */
   hueRoutes: number[];
-  hybrid: { contour: boolean; bass: boolean; pads: boolean; percussion: boolean; filter: boolean };
+  hybrid: { contour: boolean; atmosphere: boolean; bass: boolean; pads: boolean; percussion: boolean; filter: boolean };
   seed: number;
 }
 
@@ -233,7 +316,12 @@ export interface Region {
   enabled: boolean;
 }
 
-export interface PanoramaSettings {
+export interface PanoramaSettings extends SonifyShape {
+  /** which generators run: contour voices, evolving atmosphere, rhythm/event layer, classic region roles */
+  layers: { contours: boolean; atmosphere: boolean; events: boolean; regions: boolean };
+  contour: ContourSettings;
+  /** live readout of the scanned features in the view */
+  readout: boolean;
   timing: 'free' | 'beat';
   seconds: number;
   bars: number;

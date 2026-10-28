@@ -1,12 +1,13 @@
 import { describe, expect, test } from 'vitest';
 import { colorfulTexture, darkUniform, geometricImage, hazeImage } from '../../src/analysis/procedural';
-import { computeGrid, curveSummary, extractContours, fullMask, regionCurve } from '../../src/analysis/features';
+import { computeGrid, curveSummary, fullMask, regionCurve } from '../../src/analysis/features';
+import { contourPreset, extractContourSet } from '../../src/analysis/contours';
 import { defaultImageSettings, generateImageLayers } from '../../src/interpret/imageModes';
 import { testProject, mean } from './helpers';
 import type { ImageMode } from '../../src/core/types';
 
 function analyse(img: ReturnType<typeof darkUniform>) {
-  return { grid: computeGrid(img, 96, 24), gestures: extractContours(img, { sensitivity: 0.55, minLength: 24, detail: 0.5, maxGestures: 80 }) };
+  return { grid: computeGrid(img, 96, 24), contours: extractContourSet(img, contourPreset('photo')) };
 }
 
 const dark = analyse(darkUniform(240, 160));
@@ -23,12 +24,14 @@ describe('image analysis', () => {
     expect(b.texture).toBeGreaterThan(d.texture);
   });
 
-  test('contours: the geometric image yields grouped gestures, not one note per edge pixel', () => {
-    const g = extractContours(geometricImage(320, 200), { sensitivity: 0.5, minLength: 20, detail: 0.5, maxGestures: 80 });
+  test('contours: the geometric image yields ordered paths, not one note per edge pixel', () => {
+    const g = extractContourSet(geometricImage(320, 200), { ...contourPreset('photo'), minLength: 20 }).contours;
     expect(g.length).toBeGreaterThan(2);
     expect(g.length).toBeLessThan(80);
     expect(Math.max(...g.map((x) => x.length))).toBeGreaterThan(50);
-    expect(dark.gestures.length).toBeLessThan(g.length);
+    // the disc is traced as a closed loop
+    expect(g.some((c) => c.closed)).toBe(true);
+    expect(dark.contours.contours.length).toBeLessThan(g.length);
   });
 
   test('Example C: a dark uniform photo and a bright textured one make meaningfully different music in every mode', () => {
@@ -76,13 +79,18 @@ describe('image analysis', () => {
     expect(Math.min(...h.map((n) => n.dur))).toBeGreaterThanOrEqual(3);
   });
 
-  test('regeneration is deterministic; a new seed varies only what is random', () => {
+  test('regeneration is deterministic; a new seed varies the reading only below full fidelity', () => {
     const p = testProject();
-    const s = { ...defaultImageSettings(), mode: 'hybrid' as const, bars: 8 };
+    const s = { ...defaultImageSettings(), mode: 'hybrid' as const, bars: 8, fidelity: 0.3 };
     expect(generateImageLayers(bright, s, p.settings)).toEqual(generateImageLayers(bright, s, p.settings));
     const other = generateImageLayers(bright, { ...s, seed: 99 }, p.settings);
     expect(JSON.stringify(other)).not.toEqual(JSON.stringify(generateImageLayers(bright, s, p.settings)));
+    // at 100 % visual fidelity the image alone decides the contour voices
+    const strict = { ...s, mode: 'contour' as const, fidelity: 1 };
+    const notesOf = (x: typeof strict) => JSON.stringify(generateImageLayers(bright, x, p.settings).filter((l) => l.key.startsWith('image:contour')).map((l) => l.notes));
+    expect(notesOf({ ...strict, seed: 99 })).toEqual(notesOf(strict));
     // single layer regeneration returns only that layer
-    expect(generateImageLayers(bright, s, p.settings, 'image:hybrid:bass').map((l) => l.key)).toEqual(['image:hybrid:bass']);
+    expect(generateImageLayers(bright, s, p.settings, 'image:atmos:bed').map((l) => l.key)).toEqual(['image:atmos:bed']);
+    expect(generateImageLayers(bright, { ...s, hybrid: { ...s.hybrid, bass: true } }, p.settings, 'image:hybrid:bass').map((l) => l.key)).toEqual(['image:hybrid:bass']);
   });
 });

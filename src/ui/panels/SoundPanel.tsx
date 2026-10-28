@@ -4,11 +4,12 @@ import { Section, Seg, Select, Slider } from '../components/controls';
 import { FX_DEFS, FX_TYPES, defaultParams } from '../../audio/fx';
 import { uid } from '../../core/ids';
 import { ITrash } from '../components/icons';
+import { defaultImageParams } from '../../audio/imageSynth';
 
 const WAVES: { value: Wave; label: string }[] = [{ value: 'sine', label: 'Sine' }, { value: 'triangle', label: 'Tri' }, { value: 'sawtooth', label: 'Saw' }, { value: 'square', label: 'Sqr' }];
 const ENGINES: { value: Engine; label: string }[] = [
   { value: 'sub', label: 'Subtractive' }, { value: 'fm', label: 'FM' }, { value: 'modal', label: 'Modal / additive' },
-  { value: 'noise', label: 'Noise' }, { value: 'glitch', label: 'Glitch' }, { value: 'drums', label: 'Drum kit' },
+  { value: 'noise', label: 'Noise' }, { value: 'glitch', label: 'Glitch' }, { value: 'drums', label: 'Drum kit' }, { value: 'image', label: 'Image Synth' },
 ];
 const PRESET_KEY = 'aperture:userPresets';
 export function userPresets(): SynthPatch[] {
@@ -72,6 +73,31 @@ export function SoundPanel() {
           {S('Mod sustain', p.fm.modSustain, 0, 1, (v) => nest('fm', { modSustain: v }))}
         </Section>
       )}
+      {p.engine === 'image' && (() => {
+        const ip = p.image ?? defaultImageParams();
+        const setI = (patch: Partial<typeof ip>) => set({ image: { ...ip, ...patch } });
+        const lanes = new Set(t.automation.map((a) => a.target));
+        const live = (k: string) => (lanes.has(k as never) ? ' · moved by the image' : '');
+        const bars = (amps: number[], color: string) => {
+          const max = Math.max(...amps, 1e-6);
+          return <div className="harm" aria-hidden="true">{amps.map((a, k) => <span key={k} style={{ height: `${Math.max(1, (a / max) * 100)}%`, background: color }} />)}</div>;
+        };
+        return (
+          <Section title="Image Synth">
+            <p className="note">Two wavetables read from this layer’s image region: A from its luminance rows (bottom row = fundamental), B from its edge rows. Values here are the resting patch; image lanes move them while notes sound.</p>
+            <div className="row"><span className="lbl">Table A</span>{bars(ip.wavesA, '#e0a458')}</div>
+            <div className="row"><span className="lbl">Table B</span>{bars(ip.wavesB, '#6fb7d6')}</div>
+            {S(`Morph A→B${live('morph')}`, ip.morph, 0, 1, (v) => setI({ morph: v }))}
+            {S(`Detune${live('detune')}`, ip.detune, 0, 40, (v) => setI({ detune: v }), { step: 0.5, fmt: (v) => `${v.toFixed(1)}¢` })}
+            {S('FM ratio', ip.fmRatio, 0.5, 5, (v) => setI({ fmRatio: v }), { step: 0.5 })}
+            {S(`FM depth${live('fmDepth')}`, ip.fmDepth, 0, 3, (v) => setI({ fmDepth: v }), { step: 0.01 })}
+            {S(`Noise${live('noise')}`, ip.noise, 0, 0.4, (v) => setI({ noise: v }))}
+            {S(`LFO rate${live('lfoRate')}`, ip.lfoRate, 0.03, 8, (v) => setI({ lfoRate: v }), { fmt: (v) => `${v.toFixed(2)} Hz` })}
+            {S(`LFO → filter${live('lfoDepth')}`, ip.lfoDepth, 0, 1, (v) => setI({ lfoDepth: v }))}
+            {S(`Tremolo${live('tremolo')}`, ip.tremolo, 0, 1, (v) => setI({ tremolo: v }))}
+          </Section>
+        );
+      })()}
       {p.engine === 'modal' && (
         <Section title="Modal partials">
           <div className="row"><label htmlFor="ratios">Ratios</label><input id="ratios" className="txt" defaultValue={p.modal.ratios.join(', ')} key={p.name + p.modal.ratios.join()} onBlur={(e) => { const r = e.target.value.split(/[,\s]+/).map(Number).filter((x) => x > 0 && x < 40); if (r.length) { st.checkpoint(); nest('modal', { ratios: r, decays: r.map((_, i) => p.modal.decays[i] ?? 1 / (i + 1)) }); } }} /></div>

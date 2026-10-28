@@ -1,24 +1,29 @@
-// IMAGE → music. Three interpretation modes + hybrid. Each produces independent, editable layers
-// keyed by generator id, so any single layer can be regenerated without touching the others.
+// IMAGE → music. Contour mode (default) reads the traced contours as independent voices; Colour,
+// Atmospheric and Hybrid modes add colour-, light- and texture-driven layers. Every mode produces
+// independent, editable layers keyed by generator id, so any single layer can be regenerated alone.
 
 import type { FeatureKey, ImageSettings, NoteEvent, ProjectSettings } from '../core/types';
 import { hash32, rng, type Rng } from '../core/rng';
 import { barBeats, metricWeight } from '../core/time';
-import { type Curve, type CurveKey, type FeatureGrid, type Gesture, curveSummary, curveValue, fullMask, bandMask, regionCurve } from '../analysis/features';
+import { type Curve, type CurveKey, type FeatureGrid, type MaskFn, curveSummary, curveValue, fullMask, bandMask, regionCurve } from '../analysis/features';
+import { type ContourSet, contourPreset } from '../analysis/contours';
 import { type ChordSlot, type ProgressionType, generateProgression } from '../theory/progression';
 import { allowedPitches, mapY, scaleIntervals } from '../theory/scales';
 import { instrument } from '../audio/patches';
 import { curveLane, generateRole } from './roles';
 import { fxSlot, layer, type LayerOutput, ROLE_RANGE } from './layers';
+import { defaultShape, textureEvents, visualEvents, type ScanSeg } from './sonify';
+import { atmosphereLayer, contourVoiceLayers, contourVoiceSpecs, rhythmLayer, type SonicContext, voiceSound } from './sonicLayers';
 
-export interface ImageAnalysis { grid: FeatureGrid; gestures: Gesture[] }
+export interface ImageAnalysis { grid: FeatureGrid; contours: ContourSet }
 
 export function defaultImageSettings(): ImageSettings {
   return {
-    mode: 'hybrid', bars: 16, edgeSensitivity: 0.55, minContour: 24, detail: 0.5, density: 0.55, smoothing: 0.35, grouping: 0.6,
+    ...defaultShape(),
+    mode: 'contour', bars: 16, contour: contourPreset('photo'), density: 0.45, smoothing: 0.35,
     mapping: { pitch: 'brightness', velocity: 'brightness', density: 'texture', richness: 'saturation', accent: 'contrast', duration: 'texture' },
     hueRoutes: [0, 1, 2, 3, 1, 2],
-    hybrid: { contour: true, bass: true, pads: true, percussion: true, filter: true },
+    hybrid: { contour: true, atmosphere: true, bass: false, pads: false, percussion: true, filter: true },
     seed: 1,
   };
 }
@@ -29,6 +34,10 @@ export const COLOR_VOICES = [
   { name: 'Colour voice C', patch: 'Electric Keyboard' },
   { name: 'Colour voice D', patch: 'Soft Arpeggio Synth' },
 ];
+
+/** Generator keys of the contour voices (A and B keep their pre-sonification ids so regenerating
+ *  an older project updates its existing tracks, mix and mutes included). */
+export const IMAGE_VOICE_KEYS = ['image:contour:lead', 'image:contour:counter', 'image:contour:c', 'image:contour:field'];
 
 const fv = (cv: Curve, key: FeatureKey, t01: number) => curveValue(cv, key as CurveKey | 'none', t01);
 
@@ -55,79 +64,32 @@ export function imageHarmony(cv: Curve, ps: ProjectSettings, beats: number, r: R
 
 const steps = (beats: number, perBeat: number) => Math.max(8, Math.round(beats * perBeat));
 
+/** Image mode scans left → right once: x maps linearly onto the piece. */
+function imageContext(a: ImageAnalysis, s: ImageSettings, ps: ProjectSettings, beats: number): SonicContext {
+  const n = steps(beats, 2);
+  const segs: ScanSeg[] = [{ t0: 0, t1: beats, x0: 0, x1: 1 }];
+  const curve = (mask: MaskFn, o: { strip?: number; smoothing?: number } = {}) => regionCurve(a.grid, mask, { steps: n, sensitivity: s.contour.sensitivity, strip: o.strip ?? 0.5, smoothing: o.smoothing ?? s.smoothing });
+  const full = curve(fullMask);
+  return {
+    grid: a.grid, set: a.contours, shape: s, density: s.density, ps, beats, segs, seed: s.seed, origin: 'image', curve,
+    harmony: imageHarmony(full, ps, beats, rng(hash32(`${s.seed}:image:harmony`))),
+    pxWidth: a.contours.width, aspect: a.contours.width / Math.max(1, a.contours.height), res: 1 / 64,
+  };
+}
+
 // ---------------------------------------------------------------------- MODE A: contour
 
-export function contourLayers(a: ImageAnalysis, s: ImageSettings, ps: ProjectSettings, beats: number): LayerOutput[] {
-  const lead = layer('image:contour:lead', 'Contour lead', 'melody', 'imageContour', { color: '#e0a458' });
-  const counter = layer('image:contour:counter', 'Contour counterline', 'melody', 'imageContour', { patch: instrument('Digital Mallet'), pitch: { mode: 'scale', low: 45, high: 74 }, color: '#9ad0c9', mix: { volume: -9, pan: 0.25 } });
-  lead.mix = { ...lead.mix, pan: -0.15 };
-  const r = rng(hash32(`${s.seed}:contour`));
-  const gestures = a.gestures.slice(0, Math.max(2, Math.round(4 + s.density * 40)));
-  const step = s.density > 0.66 ? 0.25 : s.density > 0.33 ? 0.5 : 1;
-  const leadCount = Math.max(1, Math.ceil(gestures.length * 0.4));
-  gestures.forEach((g, gi) => {
-    const target = gi < leadCount ? lead : counter;
-    const pitches = allowedPitches(target.pitch, ps.key, ps.scale, ps.customScale);
-    const rows = pitches.length;
-    const vel = 0.4 + g.intensity * 0.45 + Math.min(0.15, g.thickness * 0.05);
-    const gate = g.curvature > 0.5 ? 0.5 : g.curvature > 0.25 ? 0.75 : 0.95;
-    const id = (k: number) => `${target.key}_${g.id}_${k}`;
-    const push = (n: Omit<NoteEvent, 'id' | 'origin'>, k: number) => {
-      if (n.start >= beats || (s.density < 1 && !r.chance(0.55 + s.density * 0.45))) return;
-      target.notes.push({ ...n, id: id(k), origin: 'image', vel: Math.min(1, n.vel) });
-    };
-    const xs = g.points.map((p) => p.x);
-    const x0 = Math.min(...xs);
-    const x1 = Math.max(...xs);
-    const ys = g.points.map((p) => p.y);
-    const ySpan = Math.max(...ys) - Math.min(...ys);
-    if (g.vertical) {
-      // vertical contour → strummed chord spanning its height
-      const lo = Math.min(...ys), hi = Math.max(...ys);
-      const r0 = Math.round(lo * (rows - 1)), r1 = Math.round(hi * (rows - 1));
-      let k = 0;
-      for (let row = r0; row <= r1 && k < 6; row += 2) {
-        const y = row / (rows - 1);
-        push({ start: Math.floor(x0 * beats / step) * step + k * 0.03, dur: step * 2, midi: mapY(y, pitches), vel: vel * 0.9, pitchY: y }, k);
-        k++;
-      }
-      return;
-    }
-    // smooth the contour (phrase smoothing)
-    const win = 1 + Math.round(s.smoothing * 6);
-    const sm = g.points.map((_, i) => {
-      let acc = 0, c = 0;
-      for (let d = -win; d <= win; d++) { const p = g.points[i + d]; if (p) { acc += p.y; c++; } }
-      return { x: g.points[i].x, y: acc / c };
-    });
-    const yAt = (x: number) => {
-      let j = 0;
-      while (j < sm.length - 1 && sm[j + 1].x < x) j++;
-      const p = sm[j], q = sm[Math.min(sm.length - 1, j + 1)];
-      const t = q.x > p.x ? (x - p.x) / (q.x - p.x) : 0;
-      return p.y + (q.y - p.y) * Math.max(0, Math.min(1, t));
-    };
-    if (ySpan < 0.03 && x1 - x0 > 0.08) {
-      // long horizontal contour → sustained note
-      const y = ys.reduce((acc, v) => acc + v, 0) / ys.length;
-      push({ start: Math.floor(x0 * beats / step) * step, dur: Math.max(step, (x1 - x0) * beats), midi: mapY(y, pitches), vel, pitchY: y }, 0);
-      return;
-    }
-    let k = 0;
-    let runRow = -1, runStart = 0, runEnd = 0, runY = 0;
-    const flush = () => { if (runRow >= 0) push({ start: runStart, dur: (runEnd - runStart) * gate, midi: mapY(runY, pitches), vel, pitchY: runY }, k++); };
-    for (let b = Math.floor(x0 * beats / step) * step; b <= x1 * beats + 1e-6; b += step) {
-      const y = yAt(b / beats);
-      const row = Math.round(y * (rows - 1));
-      const ry = row / Math.max(1, rows - 1);
-      if (row !== runRow || s.grouping < 0.5) { flush(); runRow = row; runStart = b; runY = ry; }
-      runEnd = b + step;
-    }
-    flush();
-  });
-  lead.notes.sort((x, y) => x.start - y.start);
-  counter.notes.sort((x, y) => x.start - y.start);
-  return [lead, counter];
+export function contourLayers(a: ImageAnalysis, s: ImageSettings, ps: ProjectSettings, beats: number, only?: string): LayerOutput[] {
+  const ctx = imageContext(a, s, ps, beats);
+  const out: LayerOutput[] = [];
+  const want = (k: string) => !only || only === k;
+  const specs = contourVoiceSpecs(ctx, 'rank', IMAGE_VOICE_KEYS).filter((v) => want(v.key));
+  out.push(...contourVoiceLayers(ctx, specs));
+  if (s.hybrid.percussion && (want('image:rhythm') || want('image:hybrid:perc'))) {
+    const r = rhythmLayer(ctx, 'image:rhythm', 'image:hybrid:perc');
+    if (r && want(r.key)) out.push(r);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------- MODE B: colour & texture
@@ -135,7 +97,7 @@ export function contourLayers(a: ImageAnalysis, s: ImageSettings, ps: ProjectSet
 export function colorLayers(a: ImageAnalysis, s: ImageSettings, ps: ProjectSettings, beats: number): LayerOutput[] {
   const perBeat = s.density > 0.5 ? 4 : 2;
   const n = steps(beats, perBeat);
-  const cv = regionCurve(a.grid, fullMask, { steps: n, sensitivity: s.edgeSensitivity, strip: 0.2, smoothing: s.smoothing * 0.5 });
+  const cv = regionCurve(a.grid, fullMask, { steps: n, sensitivity: s.contour.sensitivity, strip: 0.2, smoothing: s.smoothing * 0.5 });
   const voices = COLOR_VOICES.map((v, i) => layer(`image:color:${i}`, v.name, 'melody', 'imageColor', {
     patch: instrument(v.patch), pitch: { mode: 'scale', low: 48 + (i % 2) * 7, high: 84 - (i % 2) * 5 },
     mix: { volume: -9, pan: [-0.45, 0.45, -0.2, 0.2][i] }, color: ['#e07a6a', '#d9cf6a', '#7fcf9a', '#6fb7d6'][i],
@@ -145,9 +107,19 @@ export function colorLayers(a: ImageAnalysis, s: ImageSettings, ps: ProjectSetti
   const step = 1 / perBeat;
   const pitchesFor = voices.map((v) => allowedPitches(v.pitch, ps.key, ps.scale, ps.customScale));
   const counters = voices.map(() => 0);
+  const metric = s.rhythm === 'metric';
+  // outside metric mode, notes may only start where the image actually changes
+  const allowed = new Map<number, number>();
+  if (!metric) {
+    for (const e of [...visualEvents(a.grid, a.contours, s.density), ...textureEvents(a.grid)]) {
+      const j = Math.min(n - 1, Math.floor(e.x * n));
+      allowed.set(j, Math.max(allowed.get(j) ?? 0, e.x * beats - j * step));
+    }
+  }
   for (let j = 0; j < n; j++) {
     const t = (j + 0.5) / n;
-    const b = j * step;
+    if (!metric && !allowed.has(j)) continue;
+    const b = metric ? j * step : j * step + (allowed.get(j) ?? 0);
     const dens = fv(cv, s.mapping.density, t);
     const drive = dens * (0.35 + s.density * 1.1);
     if (drive < 0.1 || !r.chance(Math.min(0.95, drive * 1.4))) continue;
@@ -163,7 +135,7 @@ export function colorLayers(a: ImageAnalysis, s: ImageSettings, ps: ProjectSetti
       for (let k = 1; k < prof.length; k++) if (prof[k] > prof[best]) best = k;
       y = 1 - (best + 0.5) / prof.length;
     } else y = fv(cv, s.mapping.pitch, t);
-    const mw = metricWeight(ps.timeSig, ((b % bb) + bb) % bb);
+    const mw = metric ? metricWeight(ps.timeSig, ((b % bb) + bb) % bb) : 0.5;
     const accent = fv(cv, s.mapping.accent, t) > 0.45 && mw >= 0.5 ? 0.2 : 0;
     const vel = 0.3 + fv(cv, s.mapping.velocity, t) * 0.5 + accent;
     const rich = fv(cv, s.mapping.richness, t);
@@ -172,12 +144,12 @@ export function colorLayers(a: ImageAnalysis, s: ImageSettings, ps: ProjectSetti
     const dur = step * (0.6 + (1 - durF) * 3.5);
     // visual variation makes the rhythm more complex: syncopated or split onsets
     const vary = cv.variation[j];
-    const onsets = dens > 0.62 && s.density > 0.4 ? [0, step / 2] : vary > 0.35 ? [step / 2] : [0];
+    const onsets = metric ? (dens > 0.62 && s.density > 0.4 ? [0, step / 2] : vary > 0.35 ? [step / 2] : [0]) : [0];
     for (const o of onsets) {
       for (const off of tones) {
         target.notes.push({
           id: `${target.key}_${counters[vi]++}`, start: b + o + off * 0.012, dur, midi: mapY(y, pitches, off), vel: Math.min(1, vel * (off ? 0.8 : 1)),
-          origin: 'image', pitchY: y, stepOffset: off || undefined,
+          origin: 'image', pitchY: y, stepOffset: off || undefined, src: [t, y],
         });
       }
     }
@@ -189,11 +161,13 @@ export function colorLayers(a: ImageAnalysis, s: ImageSettings, ps: ProjectSetti
 
 export function atmosLayers(a: ImageAnalysis, s: ImageSettings, ps: ProjectSettings, beats: number, only?: string): LayerOutput[] {
   const n = steps(beats, 1);
-  const cv = regionCurve(a.grid, fullMask, { steps: n, sensitivity: s.edgeSensitivity, strip: 1.5, smoothing: Math.max(0.5, s.smoothing) });
+  const cv = regionCurve(a.grid, fullMask, { steps: n, sensitivity: s.contour.sensitivity, strip: 1.5, smoothing: Math.max(0.5, s.smoothing) });
   const sum = curveSummary(cv);
   const harmony = imageHarmony(cv, ps, beats, rng(hash32(`${s.seed}:atmos:harmony`)), sum.variation < 0.06 ? 'static' : sum.variation < 0.14 ? 'sparse' : 'modal');
-  const params = { density: s.density * 0.7, threshold: 0.45 + (1 - s.density) * 0.3, polyphony: 6, quantize: 0 };
+  const rhythm = s.rhythm;
+  const params = { density: s.density * 0.7, threshold: 0.45 + (1 - s.density) * 0.3, polyphony: 6, quantize: 0, rhythm };
   const base = { settings: ps, beats, harmony, params, origin: 'image' as const };
+  const ctx = { ...imageContext(a, s, ps, beats), harmony };
   const out: LayerOutput[] = [];
   const want = (k: string) => !only || only === k;
   if (want('image:atmos:pad')) {
@@ -204,23 +178,18 @@ export function atmosLayers(a: ImageAnalysis, s: ImageSettings, ps: ProjectSetti
     out.push(l);
   }
   if (want('image:atmos:drone')) {
-    const l = layer('image:atmos:drone', 'Atmos drone', 'drone', 'imageAtmos', { color: '#8fa3b8', mix: { volume: -3 } });
-    const r = generateRole({ ...base, curve: cv, role: 'drone', track: l, rng: rng(hash32(`${s.seed}:atmos:drone`)), idPrefix: l.key });
-    l.notes = r.notes;
-    l.automation = r.automation;
-    out.push(l);
+    const l = atmosphereLayer(ctx, 'image:atmos:drone', 'Atmos drone');
+    if (l) out.push(l);
   }
   if (want('image:atmos:melody')) {
     const l = layer('image:atmos:melody', 'Atmos fragments', 'melody', 'imageAtmos', { patch: instrument('Bell / FM Tone'), mix: { volume: -7, reverb: 0.55, delay: 0.3 }, color: '#d9cf6a' });
     l.notes = atmosFragments(cv, l.pitch, ps, beats, s.density, rng(hash32(`${s.seed}:atmos:mel`)), l.key);
+    if (s.synth === 'image') voiceSound(ctx, l, 'shimmer', fullMask, cv, 'Bell / FM Tone');
     out.push(l);
   }
   if (want('image:atmos:texture') && sum.edges > 0.04) {
-    const l = layer('image:atmos:texture', 'Atmos grain', 'texture', 'imageAtmos', { patch: instrument('Microclicks'), color: '#9ad0c9' });
-    const r = generateRole({ ...base, params: { ...params, density: s.density * 0.4 }, curve: cv, role: 'texture', track: l, rng: rng(hash32(`${s.seed}:atmos:tex`)), idPrefix: l.key });
-    l.notes = r.notes;
-    l.automation = [curveLane(cv, 'centroid', 'pan', beats, 0.2, 0.8, false, 'auto_tex_pan')];
-    out.push(l);
+    const l = rhythmLayer({ ...ctx, shape: { ...s, rhythm: rhythm === 'metric' ? 'metric' : 'texture' }, density: s.density * 0.6 }, 'image:atmos:texture', 'image:atmos:texture');
+    if (l) { l.name = 'Atmos grain'; l.automation = [...l.automation, curveLane(cv, 'centroid', 'pan', beats, 0.2, 0.8, false, 'auto_tex_pan')]; out.push(l); }
   }
   return out;
 }
@@ -249,7 +218,7 @@ function atmosFragments(cv: Curve, pitch: LayerOutput['pitch'], ps: ProjectSetti
   }
   return chosen.sort((a, z) => a - z).map((b, i) => {
     const y = Math.max(0, Math.min(1, at('centroid', b)));
-    return { id: `${key}_${i}`, start: b, dur: 3 + r() * 3, midi: mapY(y, pitches), vel: 0.35 + at('brightness', b) * 0.45, origin: 'image' as const, pitchY: y };
+    return { id: `${key}_${i}`, start: b, dur: 3 + r() * 3, midi: mapY(y, pitches), vel: 0.35 + at('brightness', b) * 0.45, origin: 'image' as const, pitchY: y, src: [b / beats, y] as [number, number] };
   });
 }
 
@@ -259,27 +228,33 @@ export function hybridLayers(a: ImageAnalysis, s: ImageSettings, ps: ProjectSett
   const out: LayerOutput[] = [];
   const want = (k: string) => !only || only.startsWith(k);
   const n = steps(beats, 2);
-  const full = regionCurve(a.grid, fullMask, { steps: n, sensitivity: s.edgeSensitivity, strip: 0.5, smoothing: s.smoothing });
-  const harmony = imageHarmony(full, ps, beats, rng(hash32(`${s.seed}:hybrid:harmony`)));
-  const base = { settings: ps, beats, harmony, origin: 'image' as const };
-  if (s.hybrid.contour && want('image:contour:lead')) out.push(...contourLayers(a, s, ps, beats).slice(0, 1));
+  const ctx = imageContext(a, s, ps, beats);
+  const full = ctx.curve(fullMask);
+  const base = { settings: ps, beats, harmony: ctx.harmony, origin: 'image' as const };
+  if (s.hybrid.contour) out.push(...contourVoiceLayers(ctx, contourVoiceSpecs(ctx, 'rank', IMAGE_VOICE_KEYS).filter((v) => want(v.key))));
+  if (s.hybrid.atmosphere && want('image:atmos:bed')) {
+    const l = atmosphereLayer(ctx, 'image:atmos:bed', 'Image atmosphere');
+    if (l) {
+      if (s.hybrid.filter && s.synth !== 'image') l.automation = [...l.automation, curveLane(full, 'brightness', 'cutoff', beats, 0.3, 0.95, false, 'auto_hybrid_bed_cutoff')];
+      out.push(l);
+    }
+  }
   if (s.hybrid.bass && want('image:hybrid:bass')) {
     // low-frequency structure of the bottom third → bass
-    const low = regionCurve(a.grid, bandMask(0.66, 1, a.grid.rows), { steps: n, sensitivity: s.edgeSensitivity, strip: 2, smoothing: Math.max(0.6, s.smoothing) });
+    const low = regionCurve(a.grid, bandMask(0.66, 1, a.grid.rows), { steps: n, sensitivity: s.contour.sensitivity, strip: 2, smoothing: Math.max(0.6, s.smoothing) });
     const l = layer('image:hybrid:bass', 'Low structure → bass', 'bass', 'imageTexture', { color: '#6a8de0' });
-    l.notes = generateRole({ ...base, curve: low, role: 'bass', track: l, rng: rng(hash32(`${s.seed}:hybrid:bass`)), params: { density: s.density, threshold: 0.4, polyphony: 1, quantize: 2 }, idPrefix: l.key, yRange: [0, 0.34] }).notes;
+    l.notes = generateRole({ ...base, curve: low, role: 'bass', track: l, rng: rng(hash32(`${s.seed}:hybrid:bass`)), params: { density: s.density, threshold: 0.4, polyphony: 1, quantize: 2, rhythm: s.rhythm }, idPrefix: l.key, yRange: [0, 0.34] }).notes;
     out.push(l);
   }
   if (s.hybrid.pads && want('image:hybrid:pads')) {
     const l = layer('image:hybrid:pads', 'Colour regions → pads', 'pad', 'imageColor', { color: '#b48ee0' });
-    l.notes = generateRole({ ...base, curve: full, role: 'pad', track: l, rng: rng(hash32(`${s.seed}:hybrid:pads`)), params: { density: s.density, threshold: 0.5, polyphony: 5, quantize: 0 }, idPrefix: l.key }).notes;
+    l.notes = generateRole({ ...base, curve: full, role: 'pad', track: l, rng: rng(hash32(`${s.seed}:hybrid:pads`)), params: { density: s.density, threshold: 0.5, polyphony: 5, quantize: 0, rhythm: s.rhythm }, idPrefix: l.key }).notes;
     if (s.hybrid.filter) l.automation = [curveLane(full, 'brightness', 'cutoff', beats, 0.3, 0.95, false, 'auto_hybrid_cutoff')];
     out.push(l);
   }
-  if (s.hybrid.percussion && want('image:hybrid:perc')) {
-    const l = layer('image:hybrid:perc', 'Fine texture → percussion', 'percussion', 'imageTexture', { color: '#e07a6a' });
-    l.notes = generateRole({ ...base, curve: full, role: 'percussion', track: l, rng: rng(hash32(`${s.seed}:hybrid:perc`)), params: { density: s.density, threshold: 0.35, polyphony: 4, quantize: 4 }, idPrefix: l.key }).notes;
-    out.push(l);
+  if (s.hybrid.percussion && (want('image:rhythm') || want('image:hybrid:perc'))) {
+    const l = rhythmLayer(ctx, 'image:rhythm', 'image:hybrid:perc');
+    if (l && (!only || only === l.key)) out.push(l);
   }
   return out;
 }
@@ -288,7 +263,7 @@ export function generateImageLayers(a: ImageAnalysis, s: ImageSettings, ps: Proj
   const beats = s.bars * barBeats(ps.timeSig);
   let layers: LayerOutput[];
   switch (s.mode) {
-    case 'contour': layers = contourLayers(a, s, ps, beats); break;
+    case 'contour': layers = contourLayers(a, s, ps, beats, only); break;
     case 'color': layers = colorLayers(a, s, ps, beats); break;
     case 'atmos': layers = atmosLayers(a, s, ps, beats, only); break;
     default: layers = hybridLayers(a, s, ps, beats, only);

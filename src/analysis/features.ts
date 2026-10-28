@@ -24,7 +24,15 @@ export interface FeatureGrid {
   gradV: Float32Array; // sum |gx| (vertical edges)
   gradH: Float32Array; // sum |gy| (horizontal edges)
   hist: Float32Array; // cols*rows*EDGE_BINS: count of pixels with magnitude ≥ bin threshold
+  /** per analysed pixel column: share of pixels on an edge, and on a vertical edge */
+  colEdge: Float32Array;
+  colVEdge: Float32Array;
+  /** per grid column: periodicity 0..1 of the column edge profile (repeated vertical structure) */
+  period: Float32Array;
 }
+
+/** Buffers of a grid, for transferring it out of the worker. */
+export const gridBuffers = (g: FeatureGrid) => [g.count, g.lum, g.lum2, g.sat, g.hueX, g.hueY, g.grad, g.gradV, g.gradH, g.hist, g.colEdge, g.colVEdge, g.period].map((a) => a.buffer as ArrayBuffer);
 
 export function toGray(img: RGBAImage): Float32Array {
   const { width: w, height: h, data } = img;
@@ -100,6 +108,7 @@ export function computeGrid(img: RGBAImage, cols: number, rows: number): Feature
     count: new Float32Array(n), lum: new Float32Array(n), lum2: new Float32Array(n), sat: new Float32Array(n),
     hueX: new Float32Array(n), hueY: new Float32Array(n), grad: new Float32Array(n), gradV: new Float32Array(n),
     gradH: new Float32Array(n), hist: new Float32Array(n * EDGE_BINS.length),
+    colEdge: new Float32Array(w), colVEdge: new Float32Array(w), period: new Float32Array(cols),
   };
   const gray = blur5(toGray(img), w, h);
   const { gx, gy, mag } = sobel(gray, w, h);
@@ -127,9 +136,46 @@ export function computeGrid(img: RGBAImage, cols: number, rows: number): Feature
       grid.gradH[c] += Math.abs(gy[i]);
       const hb = c * EDGE_BINS.length;
       for (let k = 0; k < EDGE_BINS.length && m >= EDGE_BINS[k]; k++) grid.hist[hb + k]++;
+      if (m >= EDGE_BINS[3]) {
+        grid.colEdge[x]++;
+        if (Math.abs(gx[i]) > 2 * Math.abs(gy[i])) grid.colVEdge[x]++;
+      }
     }
   }
+  for (let x = 0; x < w; x++) { grid.colEdge[x] /= h; grid.colVEdge[x] /= h; }
+  computePeriodicity(grid);
   return grid;
+}
+
+/** Normalised autocorrelation of the column edge profile in a window around each grid column:
+ *  fences, windows, tree trunks and stripes repeat at a lag; smooth or random regions do not. */
+function computePeriodicity(grid: FeatureGrid) {
+  const w = grid.colEdge.length;
+  const W = Math.max(16, Math.min(128, Math.floor(w / 2)));
+  const sig = new Float32Array(w);
+  for (let x = 0; x < w; x++) sig[x] = grid.colEdge[x] + grid.colVEdge[x];
+  for (let c = 0; c < grid.cols; c++) {
+    const cx = Math.round(((c + 0.5) / grid.cols) * w);
+    const a = Math.max(0, Math.min(w - W, cx - (W >> 1)));
+    let mean = 0;
+    for (let x = a; x < a + W; x++) mean += sig[x];
+    mean /= W;
+    let v0 = 0;
+    for (let x = a; x < a + W; x++) v0 += (sig[x] - mean) ** 2;
+    if (v0 < 1e-6 || mean < 0.01) { grid.period[c] = 0; continue; }
+    let best = 0;
+    let prev = 1, prev2 = 1;
+    for (let L = 2; L <= Math.floor(W / 3); L++) {
+      let r = 0;
+      for (let x = a; x < a + W - L; x++) r += (sig[x] - mean) * (sig[x + L] - mean);
+      r /= v0 * ((W - L) / W);
+      // a genuine period is a local maximum after the zero-lag lobe has fallen away
+      if (L >= 4 && prev > prev2 && prev >= r && prev > best && prev2 < 0.9) best = prev;
+      prev2 = prev;
+      prev = r;
+    }
+    grid.period[c] = Math.max(0, Math.min(1, (best - 0.15) / 0.6));
+  }
 }
 
 /** Edge threshold for a sensitivity 0..1 (1 = most sensitive = lowest threshold). */
@@ -165,6 +211,7 @@ export interface Curve {
   variation: Float32Array; // change from the previous step
   centroid: Float32Array; // brightness-weighted vertical centre, 0 bottom .. 1 top
   orientation: Float32Array; // 0 horizontal edges … 1 vertical edges
+  periodicity: Float32Array; // 0..1 repeated vertical structure
   /** brightness profile over rows (top→bottom) per step, for melodic pitch picking */
   profile: Float32Array[];
 }
@@ -205,7 +252,7 @@ export function regionCurve(grid: FeatureGrid, mask: MaskFn, o: CurveOptions): C
   const mk = () => new Float32Array(n);
   const cv: Curve = {
     n, brightness: mk(), saturation: mk(), hue: mk(), hueStrength: mk(), contrast: mk(), edges: mk(), texture: mk(),
-    variation: mk(), centroid: mk(), orientation: mk(), profile: [],
+    variation: mk(), centroid: mk(), orientation: mk(), periodicity: mk(), profile: [],
   };
   const thr = edgeThreshold(o.sensitivity);
   const x0 = o.x0 ?? 0;
@@ -224,6 +271,9 @@ export function regionCurve(grid: FeatureGrid, mask: MaskFn, o: CurveOptions): C
     const c0 = Math.max(0, Math.floor((cx - half) * grid.cols));
     const c1 = Math.min(grid.cols - 1, Math.max(c0, Math.ceil((cx + half) * grid.cols) - 1));
     let W = 0, L = 0, L2 = 0, S = 0, HX = 0, HY = 0, G = 0, GV = 0, GH = 0, E = 0, CY = 0, CW = 0;
+    let PER = 0;
+    for (let c = c0; c <= c1; c++) PER = Math.max(PER, grid.period?.[c] ?? 0);
+    cv.periodicity[j] = PER;
     const prof = new Float32Array(grid.rows);
     const profW = new Float32Array(grid.rows);
     for (let c = c0; c <= c1; c++) {
@@ -277,7 +327,7 @@ export function regionCurve(grid: FeatureGrid, mask: MaskFn, o: CurveOptions): C
   }
   if (o.smoothing > 0) {
     const a = 1 - Math.min(0.95, o.smoothing);
-    for (const key of ['brightness', 'saturation', 'contrast', 'edges', 'texture', 'centroid', 'orientation'] as const) {
+    for (const key of ['brightness', 'saturation', 'contrast', 'edges', 'texture', 'centroid', 'orientation', 'periodicity'] as const) {
       const arr = cv[key];
       // forward-backward one-pole: smooth without shifting features in time
       for (let j = 1; j < n; j++) arr[j] = arr[j - 1] + a * (arr[j] - arr[j - 1]);
@@ -292,7 +342,7 @@ export function regionCurve(grid: FeatureGrid, mask: MaskFn, o: CurveOptions): C
   return cv;
 }
 
-export type CurveKey = 'brightness' | 'saturation' | 'hue' | 'contrast' | 'edges' | 'texture' | 'variation' | 'centroid' | 'orientation';
+export type CurveKey = 'brightness' | 'saturation' | 'hue' | 'contrast' | 'edges' | 'texture' | 'variation' | 'centroid' | 'orientation' | 'periodicity';
 
 export function curveValue(cv: Curve, key: CurveKey | 'none', t01: number): number {
   if (key === 'none') return 0.5;
@@ -308,174 +358,7 @@ export function curveSummary(cv: Curve) {
   const avg = (a: Float32Array) => a.reduce((s, x) => s + x, 0) / a.length;
   return {
     brightness: avg(cv.brightness), saturation: avg(cv.saturation), contrast: avg(cv.contrast), edges: avg(cv.edges),
-    texture: avg(cv.texture), variation: avg(cv.variation),
+    texture: avg(cv.texture), variation: avg(cv.variation), orientation: avg(cv.orientation), periodicity: avg(cv.periodicity),
+    hue: (() => { let x = 0, y = 0; for (let j = 0; j < cv.n; j++) { x += Math.cos(cv.hue[j] * 2 * Math.PI) * cv.saturation[j]; y += Math.sin(cv.hue[j] * 2 * Math.PI) * cv.saturation[j]; } const h = Math.atan2(y, x) / (2 * Math.PI); return h < 0 ? h + 1 : h; })(),
   };
-}
-
-// ------------------------------------------------------------------ contours
-
-export interface Gesture {
-  id: string;
-  /** normalised points, x 0..1 left→right, y 0..1 bottom→top, ordered by x */
-  points: { x: number; y: number }[];
-  length: number; // pixels in the gesture
-  intensity: number; // 0..1 mean edge strength
-  thickness: number; // pixels per column
-  curvature: number; // mean absolute turning per segment (radians)
-  vertical: boolean;
-}
-
-export interface ContourOptions {
-  sensitivity: number; // 0..1
-  minLength: number; // pixels
-  detail: number; // 0..1: finer buckets with higher detail
-  maxGestures: number;
-}
-
-/** Canny-style edges (blur → Sobel → non-maximum suppression → hysteresis), then connected
- *  components, then each component is split into x-monotone chains — musical gestures. */
-export function extractContours(img: RGBAImage, o: ContourOptions): Gesture[] {
-  const { width: w, height: h } = img;
-  const gray = blur5(toGray(img), w, h);
-  const { gx, gy, mag } = sobel(gray, w, h);
-  // non-maximum suppression along the quantised gradient direction
-  const thin = new Float32Array(mag.length);
-  for (let y = 1; y < h - 1; y++) {
-    for (let x = 1; x < w - 1; x++) {
-      const i = y * w + x;
-      const m = mag[i];
-      if (m < 0.01) continue;
-      const ang = Math.atan2(gy[i], gx[i]);
-      const d = ((Math.round((ang / Math.PI) * 4) % 4) + 4) % 4;
-      const off = d === 0 ? 1 : d === 1 ? w + 1 : d === 2 ? w : w - 1;
-      if (m >= mag[i + off] && m >= mag[i - off]) thin[i] = m;
-    }
-  }
-  // threshold from the distribution: keep the strongest fraction of edge pixels
-  const vals: number[] = [];
-  for (let i = 0; i < thin.length; i += 3) if (thin[i] > 0.015) vals.push(thin[i]);
-  vals.sort((a, b) => b - a);
-  const keep = 0.08 + Math.max(0, Math.min(1, o.sensitivity)) * 0.5;
-  const hi = Math.max(0.03, vals[Math.min(vals.length - 1, Math.floor(vals.length * keep))] ?? 0.1);
-  const lo = hi * 0.5;
-  const edge = new Uint8Array(thin.length);
-  const stack: number[] = [];
-  for (let i = 0; i < thin.length; i++) if (thin[i] >= hi) { edge[i] = 2; stack.push(i); }
-  while (stack.length) {
-    const i = stack.pop()!;
-    const x = i % w;
-    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
-      if (!dx && !dy) continue;
-      const xx = x + dx;
-      if (xx < 0 || xx >= w) continue;
-      const j = i + dy * w + dx;
-      if (j < 0 || j >= thin.length || edge[j] || thin[j] < lo) continue;
-      edge[j] = 1;
-      stack.push(j);
-    }
-  }
-  // connected components
-  const label = new Int32Array(edge.length).fill(-1);
-  const comps: number[][] = [];
-  for (let i = 0; i < edge.length; i++) {
-    if (!edge[i] || label[i] >= 0) continue;
-    const comp: number[] = [];
-    const id = comps.length;
-    label[i] = id;
-    stack.push(i);
-    while (stack.length) {
-      const k = stack.pop()!;
-      comp.push(k);
-      const x = k % w;
-      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
-        const xx = x + dx;
-        if (xx < 0 || xx >= w) continue;
-        const j = k + dy * w + dx;
-        if (j < 0 || j >= edge.length || !edge[j] || label[j] >= 0) continue;
-        label[j] = id;
-        stack.push(j);
-      }
-    }
-    if (comp.length >= o.minLength) comps.push(comp);
-    else for (const k of comp) label[k] = -2;
-  }
-  const maxMag = vals[0] ?? 1;
-  const bw = Math.max(1, Math.round(10 - Math.max(0, Math.min(1, o.detail)) * 8));
-  const gapPx = Math.max(3, bw * 1.5);
-  const gestures: Gesture[] = [];
-  comps.forEach((comp, ci) => {
-    // bucket by x, split each bucket into y-clusters, link clusters into chains
-    const bins = new Map<number, { y: number; m: number }[]>();
-    for (const k of comp) {
-      const b = Math.floor((k % w) / bw);
-      const arr = bins.get(b) ?? [];
-      arr.push({ y: Math.floor(k / w), m: thin[k] || mag[k] });
-      bins.set(b, arr);
-    }
-    type Node = { x: number; y: number; n: number; m: number };
-    const chains: Node[][] = [];
-    const lastBin = new Map<Node[], number>();
-    for (const b of [...bins.keys()].sort((a, z) => a - z)) {
-      const pts = bins.get(b)!.sort((a, z) => a.y - z.y);
-      const clusters: Node[] = [];
-      let cur: { y: number; m: number }[] = [];
-      const flush = () => {
-        if (!cur.length) return;
-        clusters.push({ x: (b + 0.5) * bw, y: cur.reduce((s, p) => s + p.y, 0) / cur.length, n: cur.length, m: cur.reduce((s, p) => s + p.m, 0) / cur.length });
-        cur = [];
-      };
-      for (const p of pts) {
-        if (cur.length && p.y - cur[cur.length - 1].y > gapPx) flush();
-        cur.push(p);
-      }
-      flush();
-      for (const node of clusters) {
-        let best: Node[] | null = null;
-        let bestD = gapPx * 3;
-        for (const ch of chains) {
-          const lb = lastBin.get(ch)!;
-          if (b - lb > 2 || b === lb) continue;
-          const d = Math.abs(ch[ch.length - 1].y - node.y);
-          if (d < bestD) { bestD = d; best = ch; }
-        }
-        if (best) { best.push(node); lastBin.set(best, b); }
-        else { const ch = [node]; chains.push(ch); lastBin.set(ch, b); }
-      }
-    }
-    chains.forEach((ch, k) => {
-      const px = ch.reduce((s, nd) => s + nd.n, 0);
-      if (px < o.minLength * 0.5) return;
-      const xs = ch.map((nd) => nd.x);
-      const ys = ch.map((nd) => nd.y);
-      const xSpan = Math.max(...xs) - Math.min(...xs);
-      const ySpan = Math.max(...ys) - Math.min(...ys);
-      let turn = 0;
-      for (let i = 2; i < ch.length; i++) {
-        const a1 = Math.atan2(ch[i - 1].y - ch[i - 2].y, ch[i - 1].x - ch[i - 2].x);
-        const a2 = Math.atan2(ch[i].y - ch[i - 1].y, ch[i].x - ch[i - 1].x);
-        let d = Math.abs(a2 - a1);
-        if (d > Math.PI) d = 2 * Math.PI - d;
-        turn += d;
-      }
-      const vertical = ch.length <= 2 && ySpan > 8;
-      gestures.push({
-        id: `g${ci}_${k}`,
-        points: ch.map((nd) => ({ x: nd.x / w, y: 1 - nd.y / h })),
-        length: px,
-        intensity: Math.min(1, ch.reduce((s, nd) => s + nd.m, 0) / ch.length / maxMag),
-        thickness: px / Math.max(1, ch.length * bw),
-        curvature: ch.length > 2 ? turn / (ch.length - 2) : 0,
-        vertical: vertical || (xSpan < bw * 2 && ySpan > 10),
-      });
-      if (gestures[gestures.length - 1].vertical) {
-        // a vertical gesture keeps its vertical extent (it becomes a chord / strum)
-        const g = gestures[gestures.length - 1];
-        const comp01 = comp.map((kk) => 1 - Math.floor(kk / w) / h);
-        const mx = ch.reduce((s, nd) => s + nd.x, 0) / ch.length / w;
-        g.points = [{ x: mx, y: Math.min(...comp01) }, { x: mx, y: Math.max(...comp01) }];
-      }
-    });
-  });
-  gestures.sort((a, b) => b.length * (0.5 + b.intensity) - a.length * (0.5 + a.intensity));
-  return gestures.slice(0, o.maxGestures);
 }

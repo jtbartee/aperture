@@ -19,7 +19,7 @@ import { simulateParticles } from '../interpret/particles';
 import { bakeRoute } from '../interpret/modmatrix';
 import { captureScene, printArrangement } from '../interpret/scenes';
 import { fullMask, regionCurve, type Curve } from '../analysis/features';
-import { AnalysisCancelled, analyzeBitmap, buildLevels, decodeImage, getAnalysis, rerunContours } from '../analysis/client';
+import { AnalysisCancelled, analyzeBitmap, buildLevels, contoursStale, decodeImage, getAnalysis, rerunContours } from '../analysis/client';
 import * as db from '../persist/db';
 import { newProject, normalizeProject } from './project';
 import { instrument } from '../audio/patches';
@@ -96,7 +96,7 @@ interface Store {
   cancelAnalysis(kind: 'image' | 'panorama'): void;
   setImageSettings(patch: Partial<ImageSettings>, regenerate?: boolean): void;
   generateImage(only?: string): void;
-  setPanoramaSettings(patch: Partial<PanoramaSettings>): void;
+  setPanoramaSettings(patch: Partial<PanoramaSettings>, regenerate?: boolean): void;
   setRegions(regions: Region[], history?: boolean): void;
   generatePanorama(only?: string): void;
   setComposition(patch: Partial<CompositionSettings>): void;
@@ -141,7 +141,7 @@ export const useStore = create<Store>((set, get) => {
       return { curve: regionCurve(a.grid, fullMask, { steps, sensitivity: s.sensitivity, strip: s.stripWidth, smoothing: s.smoothing, path: scanPath(s, steps) }), beats: panoramaBeats(s, p.settings) };
     }
     const is = p.image!.settings;
-    return { curve: regionCurve(a.grid, fullMask, { steps, sensitivity: is.edgeSensitivity, strip: 0.5, smoothing: is.smoothing }), beats: is.bars * barBeats(p.settings.timeSig) };
+    return { curve: regionCurve(a.grid, fullMask, { steps, sensitivity: is.contour.sensitivity, strip: 0.5, smoothing: is.smoothing }), beats: is.bars * barBeats(p.settings.timeSig) };
   };
 
   /** Apply a change now, or (while playing) at the next beat/bar/phrase boundary. */
@@ -355,10 +355,10 @@ export const useStore = create<Store>((set, get) => {
           assetBitmaps.set(src.asset.assetId, bmp);
           await buildLevels(src.asset.assetId, bmp, kind);
         }
-        const is = p.image?.settings ?? defaultImageSettings();
+        const cur = get().project;
+        const contours = kind === 'image' ? (cur.image?.settings ?? defaultImageSettings()).contour : (cur.panorama?.settings ?? defaultPanoramaSettings()).contour;
         await analyzeBitmap(src.asset.assetId, bmp, {
-          kind, signal: ac.signal,
-          contours: { sensitivity: is.edgeSensitivity, minLength: is.minContour, detail: is.detail, maxGestures: 80 },
+          kind, signal: ac.signal, contours,
           onProgress: (f, stage) => job({ progress: f, label: stage === 'tiles' ? 'Reading image tiles…' : stage === 'features' ? 'Measuring colour, light and texture…' : stage === 'contours' ? 'Tracing contours…' : 'Done' }),
         });
         job({ status: 'done', progress: 1, label: 'Analysis ready' });
@@ -375,15 +375,13 @@ export const useStore = create<Store>((set, get) => {
     },
     cancelAnalysis: (kind) => analysisAborts[kind]?.abort(),
     setImageSettings: (patch, regenerate = false) => {
-      const before = get().project.image?.settings;
       get().commit((p) => (p.image ? { ...p, image: { ...p.image, settings: { ...p.image.settings, ...patch } } } : p));
       const p = get().project;
       if (!p.image || !regenerate) return;
-      const contourChange = before && (patch.edgeSensitivity !== undefined || patch.minContour !== undefined || patch.detail !== undefined) &&
-        (before.edgeSensitivity !== p.image.settings.edgeSensitivity || before.minContour !== p.image.settings.minContour || before.detail !== p.image.settings.detail);
-      if (contourChange && getAnalysis(p.image.asset.assetId)) {
-        const s = p.image.settings;
-        rerunContours(p.image.asset.assetId, { sensitivity: s.edgeSensitivity, minLength: s.minContour, detail: s.detail, maxGestures: 80 })
+      // compare with what the cached contours were traced with, not with the previous settings:
+      // slider drags commit as they move and only the release asks for regeneration
+      if (contoursStale(p.image.asset.assetId, p.image.settings.contour)) {
+        rerunContours(p.image.asset.assetId, p.image.settings.contour)
           .then(() => get().generateImage()).catch((e) => get().toast((e as Error).message, 'error'));
       } else get().generateImage();
     },
@@ -400,14 +398,23 @@ export const useStore = create<Store>((set, get) => {
         get().bakeModMatrix();
       });
     },
-    setPanoramaSettings: (patch) => get().commit((p) => (p.panorama ? { ...p, panorama: { ...p.panorama, settings: { ...p.panorama.settings, ...patch } } } : p)),
+    setPanoramaSettings: (patch, regenerate = false) => {
+      get().commit((p) => (p.panorama ? { ...p, panorama: { ...p.panorama, settings: { ...p.panorama.settings, ...patch } } } : p));
+      const p = get().project;
+      if (!p.panorama) return;
+      if (regenerate && contoursStale(p.panorama.asset.assetId, p.panorama.settings.contour)) {
+        rerunContours(p.panorama.asset.assetId, p.panorama.settings.contour)
+          .then(() => get().generatePanorama())
+          .catch((e) => get().toast((e as Error).message, 'error'));
+      } else if (regenerate) get().generatePanorama();
+    },
     setRegions: (regions, history = true) => get().commit((p) => (p.panorama ? { ...p, panorama: { ...p.panorama, regions } } : p), history),
     generatePanorama: (only) => {
       const p = get().project;
       if (!p.panorama) return;
       const a = getAnalysis(p.panorama.asset.assetId);
       if (!a) { get().toast('Analyse the panorama first.', 'error'); return; }
-      const layers = generatePanoramaLayers(a.grid, p.panorama, p.settings, only);
+      const layers = generatePanoramaLayers(a, p.panorama, p.settings, only);
       atBoundary('panorama', () => {
         get().applyLayers('pano:', layers, { only });
         const pp = get().project;
@@ -463,7 +470,7 @@ export const useStore = create<Store>((set, get) => {
         const a = getAnalysis(p.panorama.asset.assetId);
         if (!a) { get().toast('Analyse the panorama first.', 'error'); return; }
         const src = { ...p.panorama, settings: { ...p.panorama.settings, seed: (p.panorama.settings.seed + seedBump) >>> 0 } };
-        atBoundary('track', () => get().applyLayers('pano:', generatePanoramaLayers(a.grid, src, p.settings, g), { only: g }));
+        atBoundary('track', () => get().applyLayers('pano:', generatePanoramaLayers(a, src, p.settings, g), { only: g }));
       }
     },
     setTrackRhythm: (trackId, r) => get().updateTrack(trackId, (t) => ({ ...t, rhythm: { ...t.rhythm, ...r } })),
@@ -567,9 +574,10 @@ export const useStore = create<Store>((set, get) => {
     try {
       const bmp = await decodeImage(blob);
       await buildLevels(assetId, bmp, kind);
-      const is = get().project.image?.settings ?? defaultImageSettings();
+      const cur = get().project;
+      const contours = kind === 'image' ? (cur.image?.settings ?? defaultImageSettings()).contour : (cur.panorama?.settings ?? defaultPanoramaSettings()).contour;
       set((s) => ({ ui: { ...s.ui, analysis: { ...s.ui.analysis, [kind]: { status: 'running', progress: 0.1, label: 'Re-analysing stored image…' } } } }));
-      await analyzeBitmap(assetId, bmp, { kind, contours: { sensitivity: is.edgeSensitivity, minLength: is.minContour, detail: is.detail, maxGestures: 80 } });
+      await analyzeBitmap(assetId, bmp, { kind, contours });
       bmp.close();
       set((s) => ({ ui: { ...s.ui, analysis: { ...s.ui.analysis, [kind]: { status: 'done', progress: 1, label: 'Analysis ready' } } } }));
     } catch (e) {

@@ -90,7 +90,7 @@ export class LiveEngine {
     this.endCtx = null;
     for (const ch of g.channels.values()) ch.resetAutomation(now);
     this.applyAutomation(p, beat, now);
-    for (const ev of chaseNotes(p, beat)) this.fire(ev.track, ev.note, now, (ev.endBeat - beat) / bps);
+    for (const ev of chaseNotes(p, beat)) this.fire(ev.track, ev.note, now, (ev.endBeat - beat) / bps, beat);
   }
 
   pause() {
@@ -167,8 +167,8 @@ export class LiveEngine {
     s.forEach((x) => x.commit());
   }
 
-  private fire(track: Track, note: NoteEvent, time: number, durSec: number) {
-    this.graph!.trigger(track, note, time, durSec);
+  private fire(track: Track, note: NoteEvent, time: number, durSec: number, fromBeat?: number) {
+    this.graph!.trigger(track, note, time, durSec, fromBeat);
     this.scheduledCount++;
     if (this.logScheduling) this.scheduledLog.push({ id: note.id, beat: note.start });
   }

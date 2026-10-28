@@ -1,7 +1,9 @@
 // Main-thread side of image analysis: decode with safeguards, build a multiresolution set
 // (overview, display, analysis), stream analysis tiles to the worker, and cache results per asset.
 
-import { computeGrid, extractContours, type ContourOptions, type FeatureGrid, type Gesture, type RGBAImage } from './features';
+import type { ContourSettings } from '../core/types';
+import { computeGrid, type FeatureGrid, type RGBAImage } from './features';
+import { extractContourSet, type ContourSet } from './contours';
 
 export interface ImageLevels {
   width: number;
@@ -12,11 +14,20 @@ export interface ImageLevels {
   overview: ImageBitmap;
 }
 
-export interface AnalysisResult { grid: FeatureGrid; gestures: Gesture[]; analysisWidth: number; analysisHeight: number }
+export interface AnalysisResult {
+  grid: FeatureGrid;
+  contours: ContourSet;
+  analysisWidth: number;
+  analysisHeight: number;
+  /** the settings the current contours were traced with (so a stale trace is detected) */
+  contourSettings: ContourSettings;
+}
 
 const MAX_PIXELS = 150e6; // ~600 MB decoded; beyond this, decoding is likely to fail or freeze
 const levels = new Map<string, ImageLevels>();
 const results = new Map<string, AnalysisResult>();
+/** main-thread fallback keeps the analysis pixels so contours can be re-run without a worker */
+const fallbackPixels = new Map<string, RGBAImage>();
 
 export const getLevels = (assetId: string) => levels.get(assetId);
 export const getAnalysis = (assetId: string) => results.get(assetId);
@@ -57,7 +68,7 @@ export async function buildLevels(assetId: string, bmp: ImageBitmap, kind: 'imag
 
 export interface AnalyzeOptions {
   kind: 'image' | 'panorama';
-  contours: ContourOptions;
+  contours: ContourSettings;
   onProgress?: (f: number, stage: string) => void;
   signal?: AbortSignal;
 }
@@ -110,8 +121,9 @@ export async function analyzeBitmap(assetId: string, bmp: ImageBitmap, o: Analyz
     const grid = computeGrid(img, cols, rows);
     check();
     o.onProgress?.(0.85, 'contours');
-    const gestures = extractContours(img, o.contours);
-    const res = { grid, gestures, analysisWidth: aw, analysisHeight: ah };
+    const contours = extractContourSet(img, o.contours);
+    fallbackPixels.set(assetId, img);
+    const res = { grid, contours, analysisWidth: aw, analysisHeight: ah, contourSettings: o.contours };
     results.set(assetId, res);
     o.onProgress?.(1, 'done');
     return res;
@@ -126,7 +138,7 @@ export async function analyzeBitmap(assetId: string, bmp: ImageBitmap, o: Analyz
       if (m.type === 'progress') o.onProgress?.(m.stage === 'features' ? 0.6 : 0.85, m.stage);
       else if (m.type === 'result') {
         o.signal?.removeEventListener('abort', onAbort);
-        const res = { grid: m.grid as FeatureGrid, gestures: m.gestures as Gesture[], analysisWidth: aw, analysisHeight: ah };
+        const res = { grid: m.grid as FeatureGrid, contours: m.contours as ContourSet, analysisWidth: aw, analysisHeight: ah, contourSettings: o.contours };
         results.set(assetId, res);
         o.onProgress?.(1, 'done');
         resolve(res);
@@ -134,35 +146,44 @@ export async function analyzeBitmap(assetId: string, bmp: ImageBitmap, o: Analyz
     };
     w.onerror = (e) => { reject(new Error(e.message || 'analysis worker failed')); resetWorker(); };
     (async () => {
-      w.postMessage({ type: 'begin', width: aw, height: ah });
+      w.postMessage({ type: 'begin', asset: assetId, width: aw, height: ah });
       for (let t = 0; t < nTiles; t++) {
         check();
         const sx = Math.floor((t * W) / nTiles), ex = Math.floor(((t + 1) * W) / nTiles);
         const dx = Math.floor((t * aw) / nTiles), dw = Math.max(1, Math.floor(((t + 1) * aw) / nTiles) - dx);
         const tile = await createImageBitmap(bmp, sx, 0, ex - sx, H, { resizeWidth: dw, resizeHeight: ah, resizeQuality: 'medium' });
-        w.postMessage({ type: 'tile', x: dx, bitmap: tile }, [tile]);
+        w.postMessage({ type: 'tile', asset: assetId, x: dx, bitmap: tile }, [tile]);
         o.onProgress?.(((t + 1) / nTiles) * 0.5, 'tiles');
       }
-      w.postMessage({ type: 'analyze', cols, rows, contours: o.contours, id });
+      w.postMessage({ type: 'analyze', asset: assetId, cols, rows, contours: o.contours, id });
     })().catch((e) => reject(e));
   });
 }
 
 /** Re-run only the contour stage with new settings (the worker kept the analysis image). */
-export function rerunContours(assetId: string, contours: ContourOptions): Promise<Gesture[]> {
-  const w = getWorker();
+export function rerunContours(assetId: string, contours: ContourSettings): Promise<ContourSet> {
   const prev = results.get(assetId);
-  if (!w || !prev) return Promise.reject(new Error('Analyse the image first'));
+  if (!prev) return Promise.reject(new Error('Analyse the image first'));
+  const px = fallbackPixels.get(assetId);
+  if (px) { prev.contours = extractContourSet(px, contours); prev.contourSettings = contours; return Promise.resolve(prev.contours); }
+  const w = getWorker();
+  if (!w) return Promise.reject(new Error('Analyse the image first'));
   const id = ++msgId;
   return new Promise((resolve, reject) => {
     w.onmessage = (e) => {
       const m = e.data;
       if (m.id !== id) return;
-      if (m.type === 'contours') { prev.gestures = m.gestures; resolve(m.gestures); }
+      if (m.type === 'contours') { prev.contours = m.contours; prev.contourSettings = contours; resolve(m.contours); }
       else if (m.type === 'error') reject(new Error(m.message));
     };
-    w.postMessage({ type: 'contours', contours, id });
+    w.postMessage({ type: 'contours', asset: assetId, contours, id });
   });
+}
+
+/** True when the cached contours were traced with different settings. */
+export function contoursStale(assetId: string, s: ContourSettings): boolean {
+  const r = results.get(assetId);
+  return !!r && JSON.stringify(r.contourSettings) !== JSON.stringify(s);
 }
 
 export function forgetAsset(assetId: string) {
@@ -170,6 +191,7 @@ export function forgetAsset(assetId: string) {
   if (lv) { lv.display.close(); lv.overview.close(); }
   levels.delete(assetId);
   results.delete(assetId);
+  fallbackPixels.delete(assetId);
 }
 
 /** RGBA (from the procedural generators) → PNG blob, for factory projects. */

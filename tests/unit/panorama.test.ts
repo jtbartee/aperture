@@ -1,16 +1,19 @@
 import { describe, expect, test } from 'vitest';
 import { panoramaLandscape, LANDSCAPE_ZONES } from '../../src/analysis/procedural';
 import { computeGrid, regionCurve, fullMask } from '../../src/analysis/features';
+import { contourPreset, extractContourSet } from '../../src/analysis/contours';
 import { defaultPanoramaSettings, defaultRegions, generatePanoramaLayers, panoramaBeats, panoramaSeconds, scanPoint, timeForX, viewportOffset } from '../../src/interpret/panorama';
 import { testProject, mean } from './helpers';
 import type { PanoramaSource } from '../../src/core/types';
 
 const img = panoramaLandscape(1800, 300, 7);
 const grid = computeGrid(img, 600, 32);
+const analysis = { grid, contours: extractContourSet(img, { ...contourPreset('panorama'), maxContours: 40 }) };
 
 function source(patch: Partial<PanoramaSource['settings']> = {}): PanoramaSource {
   const regions = defaultRegions().map((r) => ({ ...r, enabled: true }));
-  return { asset: { assetId: 'x', name: 'test', mime: 'image/png', width: 1800, height: 300, bytes: 0 }, settings: { ...defaultPanoramaSettings(), timing: 'beat', bars: 48, ...patch }, regions };
+  // the classic region-role engine with its metric grid (the pre-sonification behaviour)
+  return { asset: { assetId: 'x', name: 'test', mime: 'image/png', width: 1800, height: 300, bytes: 0 }, settings: { ...defaultPanoramaSettings(), timing: 'beat', bars: 48, rhythm: 'metric', synth: 'presets', layers: { contours: false, atmosphere: false, events: false, regions: true }, ...patch }, regions };
 }
 
 describe('panorama', () => {
@@ -60,7 +63,7 @@ describe('panorama', () => {
     const p = testProject();
     const src = source();
     const beats = panoramaBeats(src.settings, p.settings);
-    const layers = generatePanoramaLayers(grid, src, p.settings);
+    const layers = generatePanoramaLayers(analysis, src, p.settings);
     expect(layers.length).toBe(5);
     const all = layers.flatMap((l) => l.notes.map((n) => ({ ...n, layer: l.key })));
     const zoneStats = LANDSCAPE_ZONES.map((z) => {
@@ -81,18 +84,18 @@ describe('panorama', () => {
     const p = testProject();
     const src = source();
     const swapped: PanoramaSource = { ...src, regions: src.regions.map((r) => (r.id === 'reg_upper' ? { ...r, role: 'arp' } : r)) };
-    const a = generatePanoramaLayers(grid, src, p.settings).find((l) => l.key === 'pano:reg_upper')!;
-    const b = generatePanoramaLayers(grid, swapped, p.settings).find((l) => l.key === 'pano:reg_upper')!;
+    const a = generatePanoramaLayers(analysis, src, p.settings).find((l) => l.key === 'pano:reg_upper')!;
+    const b = generatePanoramaLayers(analysis, swapped, p.settings).find((l) => l.key === 'pano:reg_upper')!;
     expect(a.role).toBe('pad');
     expect(b.role).toBe('arp');
     expect(b.notes.length).not.toBe(a.notes.length);
-    expect(generatePanoramaLayers(grid, src, p.settings, 'pano:reg_lower').map((l) => l.key)).toEqual(['pano:reg_lower']);
+    expect(generatePanoramaLayers(analysis, src, p.settings, 'pano:reg_lower').map((l) => l.key)).toEqual(['pano:reg_lower']);
   });
 
   test('scan resolution changes the amount of musical detail', () => {
     const p = testProject();
-    const lo = generatePanoramaLayers(grid, source({ scanResolution: 32 }), p.settings).find((l) => l.key === 'pano:reg_middle')!;
-    const hi = generatePanoramaLayers(grid, source({ scanResolution: 512 }), p.settings).find((l) => l.key === 'pano:reg_middle')!;
+    const lo = generatePanoramaLayers(analysis, source({ scanResolution: 32 }), p.settings).find((l) => l.key === 'pano:reg_middle')!;
+    const hi = generatePanoramaLayers(analysis, source({ scanResolution: 512 }), p.settings).find((l) => l.key === 'pano:reg_middle')!;
     expect(JSON.stringify(lo.notes)).not.toEqual(JSON.stringify(hi.notes));
   });
 });

@@ -1,4 +1,4 @@
-import { useRef } from 'react';
+import { useRef, useState } from 'react';
 import { engine, useStore } from '../../state/store';
 import { getAnalysis, getLevels } from '../../analysis/client';
 import { displayBeats, panoramaSeconds, regionYRange, scanPoint, timeForX, viewportOffset } from '../../interpret/panorama';
@@ -6,6 +6,9 @@ import { fullMask, regionCurve } from '../../analysis/features';
 import { allowedPitches, yForMidi } from '../../theory/scales';
 import type { Region } from '../../core/types';
 import { hexA, useStageCanvas } from '../canvas';
+import { drawContours } from '../contourDraw';
+import { laneValue, cutoffFromNorm } from '../../audio/graph';
+import { unit } from '../../audio/imageSynth';
 import { Progress } from '../components/controls';
 import { loadFactory } from '../../state/factory';
 
@@ -32,6 +35,7 @@ export function PanoramaView() {
   const job = ui.analysis.panorama;
   const fileRef = useRef<HTMLInputElement>(null);
   const zoom = useRef(1);
+  const [showContours, setShowContours] = useState(true);
   const geom = useRef({ dw: 0, dh: 0, off: 0, top: OV + 6, w: 0 });
   const drag = useRef<null | { kind: 'scrub' | 'paint' | 'lasso' | 'path' | 'overview'; x0: number; pos0: number; mask?: Uint8Array; pts: { x: number; y: number }[] }>(null);
 
@@ -100,19 +104,30 @@ export function PanoramaView() {
       src.settings.path.forEach((pt, i) => (i ? ctx.lineTo(X(pt.x), Yimg(1 - pt.y)) : ctx.moveTo(X(pt.x), Yimg(1 - pt.y))));
       ctx.stroke();
     }
-    // notes overlay: each region's notes are drawn inside the region's vertical extent
+    // contours under the scan, sounding ones bold
+    const pos = engine.position();
+    const active = new Set<string>();
+    let sounding = 0;
+    for (const tr of p.tracks) {
+      if (!tr.generator?.startsWith('pano:') || tr.mix.mute) continue;
+      for (const n of tr.notes) if (n.start <= pos && n.start + n.dur > pos) { sounding++; if (n.cid) active.add(n.cid); }
+    }
+    const an = getAnalysis(src.asset.assetId);
+    if (an && showContours) drawContours(ctx, an.contours, { X, Y: (y) => Yimg(1 - y), sx: dw, sy: dh, active, junctions: false, clip: [-20, w + 20], alpha: 0.75 });
+    // notes overlay: contour notes sit at the image point they were read from; region notes inside
+    // the region's vertical extent — all through the same scan mapping as the view
     for (const tr of p.tracks) {
       if (!tr.generator?.startsWith('pano:')) continue;
       const reg = src.regions.find((r) => `pano:${r.id}` === tr.generator);
       const [lo, hi] = reg ? regionYRange(reg) : [0, 1];
       const pitches = allowedPitches(tr.pitch, p.settings.key, p.settings.scale, p.settings.customScale);
-      ctx.fillStyle = hexA(tr.color, tr.mix.mute ? 0.25 : 0.85);
+      ctx.fillStyle = hexA(tr.color, tr.mix.mute ? 0.25 : 0.8);
       for (const n of tr.notes) {
         const nx = X(scanPoint(n.start / beats, src.settings).x);
         if (nx < -50 || nx > w + 50) continue;
-        const y01 = n.pitchY ?? yForMidi(n.midi, pitches);
         const wpx = Math.max(2, (n.dur / beats) * dw * (src.settings.direction === 'pingpong' ? 2 : 1));
-        ctx.fillRect(src.settings.direction === 'rtl' ? nx - wpx : nx, Yimg(1 - (lo + y01 * (hi - lo))) - 2, wpx, 4);
+        const yy = n.src ? Yimg(1 - n.src[1]) : Yimg(1 - (lo + (n.pitchY ?? yForMidi(n.midi, pitches)) * (hi - lo)));
+        ctx.fillRect(src.settings.direction === 'rtl' ? nx - wpx : nx, yy - 1.5, wpx, 3);
       }
     }
     // in-progress lasso / path
@@ -138,20 +153,28 @@ export function PanoramaView() {
     ctx.strokeStyle = '#f2c27b';
     ctx.lineWidth = 2;
     ctx.beginPath(); ctx.moveTo(w / 2, top - 4); ctx.lineTo(w / 2, h); ctx.stroke();
-    // live feature readout at the playhead
-    const a = getAnalysis(src.asset.assetId);
-    if (a) {
+    // live readout of the scanned features and the timbre they are producing
+    const a = an;
+    if (a && src.settings.readout) {
       const cv = regionCurve(a.grid, fullMask, { steps: 2, sensitivity: src.settings.sensitivity, strip: src.settings.stripWidth, smoothing: 0, path: [{ x: at.x }, { x: at.x }] });
       const fmt = (v: number) => v.toFixed(2);
-      const txt = `x ${at.x.toFixed(3)} · light ${fmt(cv.brightness[0])} · sat ${fmt(cv.saturation[0])} · edges ${fmt(cv.edges[0])} · texture ${fmt(cv.texture[0])}`;
+      const lines = [`x ${at.x.toFixed(3)} · light ${fmt(cv.brightness[0])} · sat ${fmt(cv.saturation[0])} · edges ${fmt(cv.edges[0])} · texture ${fmt(cv.texture[0])} · period ${fmt(cv.periodicity[0])} · vertical ${fmt(cv.orientation[0])}`];
+      const synthTrack = p.tracks.find((t) => t.generator?.startsWith('pano:') && t.patch.engine === 'image' && !t.mix.mute);
+      if (synthTrack) {
+        const lv = (target: string) => { const l = synthTrack.automation.find((x) => x.target === target); return l ? laneValue(l, pos) : null; };
+        const c = lv('cutoff'), m = lv('morph'), f = lv('fmDepth'), r = lv('lfoRate');
+        lines.push(`${synthTrack.name}: cutoff ${c === null ? '—' : `${Math.round(cutoffFromNorm(c))} Hz`} · morph ${m === null ? '—' : fmt(m)} · FM ${f === null ? '—' : fmt(unit.fmDepth(f))} · LFO ${r === null ? '—' : `${unit.lfoRate(r).toFixed(2)} Hz`} · ${sounding} notes sounding · ${active.size} contours`);
+      }
       ctx.font = '11px ui-monospace, monospace';
-      const tw = ctx.measureText(txt).width;
-      ctx.fillStyle = 'rgba(15,16,18,0.8)';
-      ctx.fillRect(w / 2 - tw / 2 - 6, top + 4, tw + 12, 18);
-      ctx.fillStyle = '#e4e1da';
-      ctx.fillText(txt, w / 2 - tw / 2, top + 17);
+      lines.forEach((txt, i) => {
+        const tw = ctx.measureText(txt).width;
+        ctx.fillStyle = 'rgba(15,16,18,0.82)';
+        ctx.fillRect(w / 2 - tw / 2 - 6, top + 4 + i * 19, tw + 12, 18);
+        ctx.fillStyle = '#e4e1da';
+        ctx.fillText(txt, w / 2 - tw / 2, top + 17 + i * 19);
+      });
     }
-  }, [project, ui]);
+  }, [project, ui, showContours]);
 
   const imgCoord = (e: { clientX: number; clientY: number }) => {
     const r = ref.current!.getBoundingClientRect();
@@ -270,8 +293,9 @@ export function PanoramaView() {
       <canvas ref={ref} onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp} onWheel={onWheel}
         style={{ cursor: ui.panoTool === 'scrub' ? 'ew-resize' : 'crosshair' }} role="img"
         aria-label={`Panorama ${pano.asset.name}. The image scrolls under a fixed playhead. Drag to scrub, click the overview strip to jump.`} />
-      <div className="hud">{pano.asset.name} · {pano.asset.width}×{pano.asset.height} · scan {Math.floor(secs / 60)}:{String(Math.round(secs % 60)).padStart(2, '0')} · {pano.settings.direction} · tool: {ui.panoTool}</div>
-      <div className="hud hud-r" style={{ pointerEvents: 'auto' }}>
+      <div className="hud" style={{ ['--hud-r-w' as string]: '400px' }}>{pano.asset.name} · {pano.asset.width}×{pano.asset.height} · scan {Math.floor(secs / 60)}:{String(Math.round(secs % 60)).padStart(2, '0')} · {pano.settings.direction} · tool: {ui.panoTool}</div>
+      <div className="hud hud-r" style={{ pointerEvents: 'auto', display: 'flex', gap: 8, alignItems: 'center' }}>
+        <label className="check"><input type="checkbox" checked={showContours} onChange={(e) => setShowContours(e.target.checked)} />contours</label>
         <span className="seg" style={{ display: 'inline-flex' }}>
           {(['scrub', 'paint', 'erase', 'lasso', 'path'] as const).map((t) => (
             <button key={t} type="button" aria-pressed={ui.panoTool === t} onClick={() => useStore.getState().setUi({ panoTool: t })} title={t === 'path' ? 'Draw a custom scan path across the image' : t === 'lasso' ? 'Lasso-select an area into the chosen region' : t === 'scrub' ? 'Drag to scrub through the image' : `${t} the chosen region's mask`}>{t}</button>

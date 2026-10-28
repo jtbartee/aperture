@@ -174,3 +174,102 @@ export function panoramaLandscape(w: number, h: number, seed = 7): RGBAImage {
   }
   return img;
 }
+
+// ------------------------------------------------------------------ evaluation fixtures
+
+export interface TruthCurve { name: string; /** pixel coordinates, y down, ~1 px apart */ pts: { x: number; y: number }[] }
+
+/** Stroke polylines onto an image as anti-aliased lines (ink on paper or light on dark). */
+export function strokeImage(w: number, h: number, curves: TruthCurve[], o: { width?: number; ink?: number; paper?: number; seed?: number; grain?: number } = {}): RGBAImage {
+  const img = blank(w, h);
+  const half = (o.width ?? 2.6) / 2;
+  const ink = o.ink ?? 40, paper = o.paper ?? 222;
+  const dist = new Float32Array(w * h).fill(1e9);
+  for (const c of curves) {
+    for (let i = 1; i < c.pts.length; i++) {
+      const a = c.pts[i - 1], b = c.pts[i];
+      const x0 = Math.floor(Math.min(a.x, b.x) - half - 2), x1 = Math.ceil(Math.max(a.x, b.x) + half + 2);
+      const y0 = Math.floor(Math.min(a.y, b.y) - half - 2), y1 = Math.ceil(Math.max(a.y, b.y) + half + 2);
+      const dx = b.x - a.x, dy = b.y - a.y, L2 = dx * dx + dy * dy || 1;
+      for (let y = Math.max(0, y0); y <= Math.min(h - 1, y1); y++) for (let x = Math.max(0, x0); x <= Math.min(w - 1, x1); x++) {
+        const t = Math.max(0, Math.min(1, ((x + 0.5 - a.x) * dx + (y + 0.5 - a.y) * dy) / L2));
+        const d = Math.hypot(x + 0.5 - a.x - t * dx, y + 0.5 - a.y - t * dy);
+        if (d < dist[y * w + x]) dist[y * w + x] = d;
+      }
+    }
+  }
+  const n = valueNoise(o.seed ?? 5);
+  for (let i = 0; i < w * h; i++) {
+    const cover = Math.max(0, Math.min(1, half + 0.5 - dist[i]));
+    const v = paper + (ink - paper) * cover + (o.grain ? (n((i % w) * 0.7, Math.floor(i / w) * 0.7) - 0.5) * o.grain : 0);
+    img.data[i * 4] = img.data[i * 4 + 1] = img.data[i * 4 + 2] = clamp255(v);
+    img.data[i * 4 + 3] = 255;
+  }
+  return img;
+}
+
+const curvePts = (f: (t: number) => { x: number; y: number }, n = 400) => {
+  const raw = Array.from({ length: n + 1 }, (_, i) => f(i / n));
+  // resample to ~1 px spacing
+  const out = [raw[0]];
+  for (const p of raw) { const q = out[out.length - 1]; if (Math.hypot(p.x - q.x, p.y - q.y) >= 1) out.push(p); }
+  return out;
+};
+
+/** Contour fidelity fixture (480×320): rising curve, falling curve, sinusoid, two crossing lines
+ *  sharing the same time span, and a branching Y. Returns the image and the ground truth. */
+export function contourFixture(): { img: RGBAImage; truth: TruthCurve[] } {
+  const truth: TruthCurve[] = [
+    { name: 'rising', pts: curvePts((t) => ({ x: 20 + t * 100, y: 140 - t * 100 + Math.sin(t * Math.PI) * 14 })) },
+    { name: 'falling', pts: curvePts((t) => ({ x: 140 + t * 100, y: 30 + t * 80 - Math.sin(t * Math.PI) * 10 })) },
+    { name: 'sine', pts: curvePts((t) => ({ x: 20 + t * 440, y: 272 + 22 * Math.sin(t * 4 * Math.PI) }), 900) },
+    { name: 'crossA', pts: curvePts((t) => ({ x: 270 + t * 190, y: 40 + t * 120 })) },
+    { name: 'crossB', pts: curvePts((t) => ({ x: 270 + t * 190, y: 160 - t * 120 })) },
+    { name: 'trunk', pts: curvePts((t) => ({ x: 20 + t * 90, y: 220 - t * 30 })) },
+    { name: 'branchUp', pts: curvePts((t) => ({ x: 110 + t * 110, y: 190 - t * 45 + Math.sin(t * Math.PI) * -6 })) },
+    { name: 'branchDown', pts: curvePts((t) => ({ x: 110 + t * 110, y: 190 + t * 38 })) },
+  ];
+  return { img: strokeImage(480, 320, truth), truth };
+}
+
+/** Uniform grey frame — no edges at all. */
+export function uniformImage(w: number, h: number, v = 128): RGBAImage {
+  const img = blank(w, h);
+  for (let i = 0; i < w * h; i++) { img.data[i * 4] = img.data[i * 4 + 1] = img.data[i * 4 + 2] = v; img.data[i * 4 + 3] = 255; }
+  return img;
+}
+
+/** Vertical bars at irregular x positions (free-time fixture). Returns the bar centres (normalised). */
+export function irregularBars(w: number, h: number, xs: number[], width = 4): { img: RGBAImage; xs: number[] } {
+  const img = uniformImage(w, h, 30);
+  for (const u of xs) {
+    const cx = u * w;
+    for (let y = Math.floor(h * 0.2); y < Math.floor(h * 0.8); y++) for (let x = Math.floor(cx - width / 2); x < Math.ceil(cx + width / 2); x++) {
+      if (x < 0 || x >= w) continue;
+      const j = (y * w + x) * 4;
+      img.data[j] = img.data[j + 1] = img.data[j + 2] = 230;
+    }
+  }
+  return { img, xs };
+}
+
+/** Three overlapping mountain ridges (layered silhouettes) — three independent ridgelines. */
+export function ridgesImage(w: number, h: number, seed = 4): { img: RGBAImage; ridges: ((u: number) => number)[] } {
+  const img = blank(w, h);
+  const n = valueNoise(seed);
+  const ridges = [
+    (u: number) => 0.32 + 0.1 * Math.sin(u * 5.1 + 0.4) + (fbm(n, u * 8, 1.1, 3) - 0.5) * 0.1,
+    (u: number) => 0.52 + 0.08 * Math.sin(u * 7.3 + 2.0) + (fbm(n, u * 10, 4.2, 3) - 0.5) * 0.1,
+    (u: number) => 0.72 + 0.06 * Math.sin(u * 9.7 + 4.1) + (fbm(n, u * 12, 7.7, 3) - 0.5) * 0.08,
+  ];
+  const tones = [[205, 190, 175], [130, 120, 135], [80, 74, 92], [40, 36, 50]];
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const u = x / w, v = y / h;
+    let layer = 0;
+    for (let k = 0; k < 3; k++) if (v > ridges[k](u)) layer = k + 1;
+    const c = tones[layer];
+    const j = (y * w + x) * 4;
+    img.data[j] = c[0]; img.data[j + 1] = c[1]; img.data[j + 2] = c[2]; img.data[j + 3] = 255;
+  }
+  return { img, ridges };
+}

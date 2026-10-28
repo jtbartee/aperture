@@ -1,12 +1,13 @@
 // The mixing graph shared by live playback and offline rendering:
-//   voices → channel input → automation filter → automation gain → inserts → auto-pan → pan →
+//   voices → channel input → automation filter (cutoff, resonance) → spectral tilt → automation gain → inserts → auto-pan → pan →
 //   fader → mute → master;   fader → sends → reverb / delay buses → master
 //   master → glue compressor → limiter (150 ms release) → destination
 
 import * as Tone from 'tone';
 import type { AutomationLane, ModTarget, NoteEvent, Project, Track } from '../core/types';
 import { createFx, type FxUnit } from './fx';
-import { dbToGain, startVoice, type Voice } from './voices';
+import { type BusName, dbToGain, startVoice, type Voice, type VoiceOpts } from './voices';
+import { defaultImageParams, unit } from './imageSynth';
 import { audible } from './graph-audible';
 
 export { audible };
@@ -16,6 +17,7 @@ export const cutoffFromNorm = (v: number) => 60 * Math.pow(2, Math.max(0, Math.m
 export class Channel {
   readonly input: GainNode;
   readonly autoFilter: BiquadFilterNode;
+  readonly tilt: BiquadFilterNode;
   readonly autoGain: GainNode;
   readonly autoPan: StereoPannerNode;
   readonly panner: Tone.Panner;
@@ -31,6 +33,10 @@ export class Channel {
   voices = new Set<Voice>();
   lastMidi?: number;
   held = new Map<number, Voice>();
+  /** constant-source buses that Image Synth voices follow while they sound */
+  private buses = new Map<BusName, ConstantSourceNode>();
+  /** the track's patch, for the buses' resting values */
+  patch?: Track['patch'];
 
   constructor(readonly graph: AudioGraph, readonly id: string) {
     const raw = graph.raw;
@@ -39,6 +45,10 @@ export class Channel {
     this.autoFilter.type = 'lowpass';
     this.autoFilter.frequency.value = 20000;
     this.autoFilter.Q.value = 0.5;
+    this.tilt = raw.createBiquadFilter();
+    this.tilt.type = 'highshelf';
+    this.tilt.frequency.value = 2500;
+    this.tilt.gain.value = 0;
     this.autoGain = raw.createGain();
     this.autoPan = raw.createStereoPanner();
     this.panner = new Tone.Panner(0);
@@ -48,7 +58,7 @@ export class Channel {
     this.sendD = new Tone.Gain(0);
     this.autoSendR = new Tone.Gain(1);
     this.autoSendD = new Tone.Gain(1);
-    this.input.connect(this.autoFilter).connect(this.autoGain);
+    this.input.connect(this.autoFilter).connect(this.tilt).connect(this.autoGain);
     Tone.connect(this.autoPan, this.panner);
     this.panner.connect(this.fader);
     this.fader.connect(this.muteGain);
@@ -82,7 +92,29 @@ export class Channel {
     this.rewire();
   }
 
+  /** Resting value of a bus: the patch's static Image Synth parameter. */
+  private busBase(name: BusName): number {
+    const ip = this.patch?.image ?? defaultImageParams();
+    return { morph: ip.morph, detune: ip.detune, fmDepth: ip.fmDepth, noise: ip.noise, lfoRate: ip.lfoRate, lfoDepth: ip.lfoDepth, tremolo: ip.tremolo }[name];
+  }
+
+  bus(name: BusName): ConstantSourceNode {
+    let b = this.buses.get(name);
+    if (!b) {
+      b = this.graph.raw.createConstantSource();
+      b.offset.value = this.busBase(name);
+      b.start();
+      this.buses.set(name, b);
+    }
+    return b;
+  }
+
   resetAutomation(time: number) {
+    for (const [name, b] of this.buses) { b.offset.cancelScheduledValues(time); b.offset.setValueAtTime(this.busBase(name), time); }
+    this.autoFilter.Q.cancelScheduledValues(time);
+    this.autoFilter.Q.setValueAtTime(0.5, time);
+    this.tilt.gain.cancelScheduledValues(time);
+    this.tilt.gain.setValueAtTime(0, time);
     this.autoFilter.frequency.cancelScheduledValues(time);
     this.autoFilter.frequency.setValueAtTime(20000, time);
     this.autoGain.gain.cancelScheduledValues(time);
@@ -102,6 +134,13 @@ export class Channel {
       case 'pan': this.autoPan.pan.setTargetAtTime(Math.max(-1, Math.min(1, v * 2 - 1)), time, tc); return;
       case 'reverbSend': this.autoSendR.gain.setTargetAtTime(v * 1.5, time, tc); return;
       case 'delaySend': this.autoSendD.gain.setTargetAtTime(v * 1.5, time, tc); return;
+      case 'resonance': this.autoFilter.Q.setTargetAtTime(unit.resonance(v), time, tc); return;
+      case 'richness': this.tilt.gain.setTargetAtTime(unit.richness(v), time, tc); return;
+      case 'morph': case 'detune': case 'fmDepth': case 'noise': case 'lfoRate': case 'lfoDepth': case 'tremolo':
+        // only Image Synth voices listen; skip creating buses for other engines
+        if (this.patch?.engine === 'image') this.bus(target).offset.setTargetAtTime(unit[target](v), time, tc);
+        return;
+      case 'attack': case 'release': case 'fmRatio': return; // read per note at its onset
       default:
         for (const u of this.fx) if (u.mod(target, v, time)) return;
     }
@@ -116,7 +155,9 @@ export class Channel {
   dispose() {
     this.killAll(this.graph.raw.currentTime);
     this.setFx([], '');
-    try { this.input.disconnect(); this.autoFilter.disconnect(); this.autoGain.disconnect(); this.autoPan.disconnect(); } catch { /* ignore */ }
+    for (const b of this.buses.values()) { try { b.stop(); b.disconnect(); } catch { /* ignore */ } }
+    this.buses.clear();
+    try { this.input.disconnect(); this.autoFilter.disconnect(); this.tilt.disconnect(); this.autoGain.disconnect(); this.autoPan.disconnect(); } catch { /* ignore */ }
     for (const n of [this.panner, this.fader, this.muteGain, this.sendR, this.sendD, this.autoSendR, this.autoSendD, this.meter]) n?.dispose();
   }
 }
@@ -135,6 +176,8 @@ export class AudioGraph {
   readonly analyser?: Tone.Analyser;
   readonly masterMeter?: Tone.Meter;
   readonly channels = new Map<string, Channel>();
+  /** seconds per beat (for per-note pitch bends) */
+  spb = 0.5;
   private ready: Promise<void>;
 
   constructor(readonly live: boolean) {
@@ -171,10 +214,12 @@ export class AudioGraph {
     for (const [id, ch] of this.channels) if (!ids.has(id)) { ch.dispose(); this.channels.delete(id); }
     const anySolo = project.tracks.some((t) => t.mix.solo);
     const spb = 60 / project.settings.bpm;
+    this.spb = spb;
     this.delay.delayTime.rampTo(Math.min(2.4, spb * 0.75), 0.05);
     for (const t of project.tracks) {
       let ch = this.channels.get(t.id);
       if (!ch) { ch = new Channel(this, t.id); this.channels.set(t.id, ch); }
+      ch.patch = t.patch;
       ch.panner.pan.rampTo(t.mix.pan, 0.03);
       ch.fader.gain.rampTo(dbToGain(t.mix.volume), 0.03);
       ch.muteGain.gain.rampTo(audible(t, anySolo) ? 1 : 0, 0.02);
@@ -189,8 +234,9 @@ export class AudioGraph {
     }
   }
 
-  /** Schedule one note. `time`/`dur` are in context seconds. */
-  trigger(track: Track, note: NoteEvent, time: number, dur: number): Voice | null {
+  /** Schedule one note. `time`/`dur` are in context seconds; `fromBeat` is where the voice really
+   *  starts when a held note is chased mid-way (its bend skips the part already past). */
+  trigger(track: Track, note: NoteEvent, time: number, dur: number, fromBeat?: number): Voice | null {
     const ch = this.channels.get(track.id);
     if (!ch) return null;
     // polyphony: steal the oldest voice still sounding at `time`
@@ -202,7 +248,14 @@ export class AudioGraph {
         for (let i = 0; i <= sounding.length - p.poly; i++) { sounding[i].kill(time); ch.voices.delete(sounding[i]); }
       }
     }
-    const v = startVoice(this.raw, ch.input, p, note.midi, note.vel, time, dur, { glideFrom: p.poly === 1 ? ch.lastMidi : undefined });
+    const o: VoiceOpts = { glideFrom: p.poly === 1 ? ch.lastMidi : undefined, timbre: note.timbre, bend: note.bend, spb: this.spb, bendOffset: fromBeat !== undefined ? Math.max(0, fromBeat - note.start) : 0 };
+    for (const lane of track.automation) {
+      if (lane.target !== 'attack' && lane.target !== 'release' && lane.target !== 'fmRatio') continue;
+      const v = laneValue(lane, note.start);
+      if (v !== null) o[lane.target] = unit[lane.target](v);
+    }
+    if (p.engine === 'image') o.bus = (n) => ch.bus(n);
+    const v = startVoice(this.raw, ch.input, p, note.midi, note.vel, time, dur, o);
     ch.lastMidi = note.midi;
     ch.voices.add(v);
     // prune finished voices so the set stays small

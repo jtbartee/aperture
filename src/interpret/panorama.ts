@@ -6,18 +6,27 @@ import type { PanoramaSettings, PanoramaSource, ProjectSettings, Region, Role } 
 import { hash32, rng } from '../core/rng';
 import { barBeats } from '../core/time';
 import { type FeatureGrid, bandMask, bitsMask, fullMask, regionCurve, type MaskFn } from '../analysis/features';
+import { type ContourSet, contourPreset } from '../analysis/contours';
 import { instrument } from '../audio/patches';
 import { curveLane, generateRole } from './roles';
 import { imageHarmony } from './imageModes';
 import { fxSlot, layer, type LayerOutput, PALETTE } from './layers';
+import { defaultShape, scanSegments } from './sonify';
+import { atmosphereLayer, contourVoiceLayers, contourVoiceSpecs, rhythmLayer, type SonicContext } from './sonicLayers';
 
 export function defaultPanoramaSettings(): PanoramaSettings {
   return {
+    ...defaultShape(),
+    layers: { contours: true, atmosphere: true, events: true, regions: false },
+    contour: { ...contourPreset('panorama'), maxContours: 40 },
+    readout: true,
     timing: 'free', seconds: 120, bars: 32, direction: 'ltr', region: { x0: 0, x1: 1 }, path: [],
-    scanResolution: 256, stripWidth: 0.5, sensitivity: 0.55, density: 0.5, smoothing: 0.4, polyphony: 5, threshold: 0.45,
+    scanResolution: 256, stripWidth: 0.5, sensitivity: 0.55, density: 0.45, smoothing: 0.4, polyphony: 5, threshold: 0.45,
     quantize: 4, seed: 1,
   };
 }
+
+export const PANO_VOICE_KEYS = ['pano:contour:low', 'pano:contour:mid', 'pano:contour:high', 'pano:contour:detail'];
 
 export function defaultRegions(): Region[] {
   return [
@@ -111,9 +120,13 @@ export function scanPath(s: PanoramaSettings, steps: number): { x: number; y?: n
   return Array.from({ length: steps }, (_, j) => scanPoint(steps > 1 ? j / (steps - 1) : 0, s));
 }
 
-/** Generate one layer per enabled region. Harmony comes from the whole frame along the scan, so
- *  all regions share chords. `only` regenerates a single region's layer. */
-export function generatePanoramaLayers(grid: FeatureGrid, src: PanoramaSource, ps: ProjectSettings, only?: string): LayerOutput[] {
+/** The panorama as a continuous score. Contour voices (low ridge → drone, middle → melody, upper →
+ *  harmonic texture, fine detail → micro-events) each take their timing from their own contours;
+ *  the atmosphere bed is re-voiced only at big changes while its Image Synth lanes evolve along the
+ *  scan; the rhythm layer follows the rhythm mode; classic region roles remain available. Every
+ *  layer uses the same scan mapping (scanPoint) as the scrolling view. `only` regenerates one layer. */
+export function generatePanoramaLayers(a: { grid: FeatureGrid; contours: ContourSet }, src: PanoramaSource, ps: ProjectSettings, only?: string): LayerOutput[] {
+  const grid = a.grid;
   const s = src.settings;
   const beats = panoramaBeats(s, ps);
   const n = Math.max(16, Math.round(s.scanResolution));
@@ -122,6 +135,24 @@ export function generatePanoramaLayers(grid: FeatureGrid, src: PanoramaSource, p
   const frame = regionCurve(grid, fullMask, { ...curveOpts, strip: Math.max(1, s.stripWidth * 3), smoothing: Math.max(0.5, s.smoothing) });
   const harmony = imageHarmony(frame, ps, beats, rng(hash32(`${s.seed}:pano:harmony`)));
   const out: LayerOutput[] = [];
+  const want = (k: string) => !only || only === k;
+  const dense = scanPath(s, 1024);
+  const ctx: SonicContext = {
+    grid, set: a.contours, shape: s, density: s.density, ps, beats, segs: scanSegments(beats, dense.length, (j) => dense[j].x), seed: s.seed, origin: 'panorama',
+    curve: (mask, o = {}) => regionCurve(grid, mask, { ...curveOpts, strip: o.strip ?? s.stripWidth, smoothing: Math.max(o.smoothing ?? 0, s.smoothing) }),
+    harmony, pxWidth: a.contours.width, aspect: a.contours.width / Math.max(1, a.contours.height), res: Math.max(1 / 64, beats / 12000),
+  };
+  const layers = s.layers ?? { contours: false, atmosphere: false, events: false, regions: true };
+  if (layers.contours) out.push(...contourVoiceLayers(ctx, contourVoiceSpecs(ctx, 'register', PANO_VOICE_KEYS).filter((v) => want(v.key))));
+  if (layers.atmosphere && want('pano:atmos')) {
+    const l = atmosphereLayer(ctx, 'pano:atmos', 'Atmosphere (evolving drone)');
+    if (l) out.push(l);
+  }
+  if (layers.events && (want('pano:rhythm') || want('pano:drums'))) {
+    const l = rhythmLayer(ctx, 'pano:rhythm', 'pano:drums');
+    if (l && (!only || only === l.key)) out.push(l);
+  }
+  if (!layers.regions) return out;
   src.regions.forEach((r, i) => {
     if (!r.enabled) return;
     const key = `pano:${r.id}`;
@@ -131,7 +162,7 @@ export function generatePanoramaLayers(grid: FeatureGrid, src: PanoramaSource, p
     const l = layer(key, `${r.name} → ${r.role}`, r.role, 'panorama', { patch: instrument(ROLE_PATCHES[r.role]), color: PALETTE[(i * 3 + 1) % PALETTE.length], fx });
     const res = generateRole({
       curve: cv, role: r.role, track: l, settings: ps, beats, harmony, rng: rng(hash32(`${s.seed}:${key}`)),
-      params: { density: s.density, threshold: s.threshold, polyphony: s.polyphony, quantize: s.quantize }, origin: 'panorama',
+      params: { density: s.density, threshold: s.threshold, polyphony: s.polyphony, quantize: s.rhythm === 'metric' ? s.quantize : 0, rhythm: s.rhythm }, origin: 'panorama',
       idPrefix: key, yRange: regionYRange(r),
     });
     l.notes = res.notes;

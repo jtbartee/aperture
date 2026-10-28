@@ -4,6 +4,7 @@
 // The same code runs in the live AudioContext and in an OfflineAudioContext for WAV export.
 
 import type { DrumVoice, SynthPatch } from '../core/types';
+import { defaultImageParams } from './imageSynth';
 
 export interface Voice {
   start: number;
@@ -14,11 +15,27 @@ export interface Voice {
   kill(t: number): void;
 }
 
+/** Channel modulation buses an Image Synth voice listens to while it sounds (audio/graph.ts). */
+export type BusName = 'morph' | 'detune' | 'fmDepth' | 'noise' | 'lfoRate' | 'lfoDepth' | 'tremolo';
+
 export interface VoiceOpts {
   /** multiplier applied to the patch cutoff (from automation / image modulation) */
   cutoffMul?: number;
   /** previous MIDI note for mono glide */
   glideFrom?: number;
+  /** per-note overrides read from lanes at the onset */
+  attack?: number;
+  release?: number;
+  fmRatio?: number;
+  /** 0..1 per-note timbre (Image Synth: wave balance and brightness) */
+  timbre?: number;
+  /** continuous pitch: [beats after onset, semitones] */
+  bend?: [number, number][];
+  /** seconds per beat (for bend timing) and how many beats of the note were skipped (chase) */
+  spb?: number;
+  bendOffset?: number;
+  /** live modulation sources; absent = static patch values */
+  bus?: (name: BusName) => AudioNode | null;
 }
 
 const noiseBuffers = new WeakMap<BaseAudioContext, AudioBuffer>();
@@ -61,6 +78,9 @@ function velGain(p: SynthPatch, vel: number) {
 interface Built {
   sources: AudioScheduledSourceNode[];
   amp: GainNode;
+  /** detune params that follow per-note pitch bends */
+  pitch: AudioParam[];
+  filter?: BiquadFilterNode;
   /** called with the gate-off time to schedule the release stage; returns tail length */
   onRelease: (t: number) => number;
   /** earliest time a release may start (end of attack) */
@@ -145,6 +165,7 @@ function finishChain(
   sources: AudioScheduledSourceNode[], pitchTargets: OscillatorNode[], out: AudioNode, o: VoiceOpts, gateOff?: number,
 ): Built {
   const nyq = ctx.sampleRate * 0.45;
+  if (o.attack !== undefined || o.release !== undefined) p = { ...p, amp: { ...p.amp, a: o.attack ?? p.amp.a, r: o.release ?? p.amp.r } };
   const filter = ctx.createBiquadFilter();
   filter.type = p.filter.type;
   filter.Q.value = Math.max(0.0001, p.filter.res);
@@ -202,6 +223,8 @@ function finishChain(
   return {
     sources,
     amp,
+    pitch: pitchTargets.map((x) => x.detune),
+    filter,
     attackEnd: aEnd,
     onRelease: (tOff) => {
       const r = Math.max(0.01, p.amp.r);
@@ -264,10 +287,12 @@ function buildModal(ctx: BaseAudioContext, p: SynthPatch, midi: number, vel: num
   const sources: AudioScheduledSourceNode[] = [];
   const mix = ctx.createGain();
   const partialGains: GainNode[] = [];
+  const partials: OscillatorNode[] = [];
   const nyq = ctx.sampleRate * 0.45;
   p.modal.ratios.forEach((ratio, i) => {
     if (f * ratio > nyq) return;
     const osc = ctx.createOscillator();
+    partials.push(osc);
     osc.frequency.value = f * ratio;
     const g = ctx.createGain();
     const w = 1 / (1 + i * 0.9);
@@ -297,7 +322,113 @@ function buildModal(ctx: BaseAudioContext, p: SynthPatch, midi: number, vel: num
   mix.gain.value = 0.8;
   // the voice-level envelope is a gate; the partials carry their own decays
   const gateP = { ...p, amp: { a: 0.001, d: 0.1, s: 1, r: p.amp.r }, filter: { ...p.filter, envAmt: 0 } };
-  return finishChain(ctx, gateP, midi, vel, t, mix, sources, [], out, o, gateOff);
+  return finishChain(ctx, gateP, midi, vel, t, mix, sources, partials, out, { ...o, attack: undefined }, gateOff);
+}
+
+const waveCache = new WeakMap<BaseAudioContext, Map<string, PeriodicWave>>();
+function periodicWave(ctx: BaseAudioContext, amps: number[]): PeriodicWave {
+  let m = waveCache.get(ctx);
+  if (!m) { m = new Map(); waveCache.set(ctx, m); }
+  const key = amps.join(',');
+  let w = m.get(key);
+  if (!w) {
+    const real = new Float32Array(amps.length + 1);
+    const imag = new Float32Array(amps.length + 1);
+    amps.forEach((a, k) => { imag[k + 1] = a; });
+    w = ctx.createPeriodicWave(real, imag);
+    m.set(key, w);
+  }
+  return w;
+}
+
+/** IMAGE SYNTH voice: wavetable A ↔ B morph (both read from the image), FM, band-passed noise,
+ *  an LFO for filter wobble and tremolo. Each live parameter sums a static base with the
+ *  channel's modulation bus, so lanes reshape a held note while it sounds. */
+function buildImage(ctx: BaseAudioContext, p: SynthPatch, midi: number, vel: number, t: number, out: AudioNode, o: VoiceOpts, gateOff?: number): Built {
+  const ip = p.image ?? defaultImageParams();
+  const f = mtof(midi);
+  const nyq = ctx.sampleRate * 0.45;
+  const sources: AudioScheduledSourceNode[] = [];
+  const bus = (n: BusName) => o.bus?.(n) ?? null;
+  const scaled = (src: AudioNode, k: number, dest: AudioParam) => { const g = ctx.createGain(); g.gain.value = k; src.connect(g).connect(dest); };
+  // keep partials below Nyquist: drop the upper harmonics for high notes
+  const maxH = Math.max(1, Math.floor(nyq / f));
+  const tableA = periodicWave(ctx, ip.wavesA.slice(0, maxH));
+  const tableB = periodicWave(ctx, ip.wavesB.slice(0, maxH));
+  const oscA = ctx.createOscillator();
+  const oscB = ctx.createOscillator();
+  oscA.setPeriodicWave(tableA);
+  oscB.setPeriodicWave(tableB);
+  oscA.frequency.value = f;
+  oscB.frequency.value = f;
+  const tOff = ((o.timbre ?? 0.5) - 0.5) * 0.4; // thicker contours lean to the brighter table
+  const gA = ctx.createGain();
+  const gB = ctx.createGain();
+  const mMorph = bus('morph');
+  if (mMorph) {
+    gA.gain.value = 1 - tOff;
+    gB.gain.value = tOff;
+    mMorph.connect(gB.gain);
+    scaled(mMorph, -1, gA.gain);
+  } else {
+    const m = Math.max(0, Math.min(1, ip.morph + tOff));
+    gA.gain.value = 1 - m;
+    gB.gain.value = m;
+  }
+  const mDet = bus('detune');
+  if (mDet) { scaled(mDet, -0.5, oscA.detune); scaled(mDet, 0.5, oscB.detune); }
+  else { oscA.detune.value = -ip.detune / 2; oscB.detune.value = ip.detune / 2; }
+  const mix = ctx.createGain();
+  mix.gain.value = 0.9;
+  oscA.connect(gA).connect(mix);
+  oscB.connect(gB).connect(mix);
+  // FM: one sine modulator on both tables
+  const ratio = o.fmRatio ?? ip.fmRatio;
+  const mod = ctx.createOscillator();
+  mod.frequency.value = f * ratio;
+  const modGain = ctx.createGain();
+  const vg = velGain(p, vel);
+  const mFm = bus('fmDepth');
+  const dev = f * ratio * (0.6 + 0.4 * vg);
+  if (mFm) { modGain.gain.value = 0; scaled(mFm, dev, modGain.gain); }
+  else modGain.gain.value = ip.fmDepth * dev;
+  mod.connect(modGain);
+  modGain.connect(oscA.frequency);
+  modGain.connect(oscB.frequency);
+  // noise, band-passed around the note
+  const nz = ctx.createBufferSource();
+  nz.buffer = noiseBuffer(ctx);
+  nz.loop = true;
+  const bp = ctx.createBiquadFilter();
+  bp.type = 'bandpass';
+  bp.frequency.value = Math.min(nyq, f * 3);
+  bp.Q.value = 1.2;
+  const nG = ctx.createGain();
+  const mNoise = bus('noise');
+  if (mNoise) { nG.gain.value = 0; scaled(mNoise, 2.5, nG.gain); }
+  else nG.gain.value = ip.noise * 2.5;
+  nz.connect(bp).connect(nG).connect(mix);
+  // LFO → tremolo (before the filter: amplitude modulation commutes) and filter wobble
+  const lfo = ctx.createOscillator();
+  const mRate = bus('lfoRate');
+  if (mRate) { lfo.frequency.value = 0; mRate.connect(lfo.frequency); }
+  else lfo.frequency.value = ip.lfoRate;
+  const trem = ctx.createGain();
+  const tremDepth = ctx.createGain();
+  const mTrem = bus('tremolo');
+  if (mTrem) { trem.gain.value = 1; tremDepth.gain.value = 0; scaled(mTrem, 0.5, tremDepth.gain); scaled(mTrem, -0.5, trem.gain); }
+  else { trem.gain.value = 1 - ip.tremolo / 2; tremDepth.gain.value = ip.tremolo / 2; }
+  lfo.connect(tremDepth).connect(trem.gain);
+  mix.connect(trem);
+  for (const src of [oscA, oscB, mod, nz, lfo]) { src.start(t); sources.push(src); }
+  const built = finishChain(ctx, p, midi, vel, t, trem, sources, [oscA, oscB, mod], out, { ...o, cutoffMul: (o.cutoffMul ?? 1) * Math.pow(2, ((o.timbre ?? 0.5) - 0.5) * 1.2) }, gateOff);
+  const wob = ctx.createGain();
+  const mDepth = bus('lfoDepth');
+  if (mDepth) { wob.gain.value = 0; scaled(mDepth, 1200, wob.gain); }
+  else wob.gain.value = ip.lfoDepth * 1200;
+  lfo.connect(wob);
+  if (built.filter) wob.connect(built.filter.detune);
+  return built;
 }
 
 function buildNoise(ctx: BaseAudioContext, p: SynthPatch, midi: number, vel: number, t: number, out: AudioNode, o: VoiceOpts, gateOff?: number): Built {
@@ -511,7 +642,28 @@ function buildDrum(ctx: BaseAudioContext, p: SynthPatch, midi: number, vel: numb
   }
   amp.gain.value = 1;
   amp.connect(out);
-  return { sources, amp, attackEnd: t, onRelease: () => tail + 0.05 };
+  return { sources, amp, pitch: [], attackEnd: t, onRelease: () => tail + 0.05 };
+}
+
+/** Continuous pitch along a contour: each detune param ramps through the bend points. Points
+ *  before `offset` (a chased note) are skipped; nothing is scheduled past the gate. */
+function applyBend(params: AudioParam[], bend: [number, number][], t: number, spb: number, offset: number, gateOff?: number) {
+  const at = (b: number) => {
+    if (b <= bend[0][0]) return bend[0][1];
+    for (let i = 1; i < bend.length; i++) if (bend[i][0] >= b) { const a = bend[i - 1], z = bend[i]; return a[1] + ((z[1] - a[1]) * (b - a[0])) / Math.max(1e-9, z[0] - a[0]); }
+    return bend[bend.length - 1][1];
+  };
+  const end = gateOff ?? Infinity;
+  for (const prm of params) {
+    const base = prm.value;
+    prm.setValueAtTime(base + at(offset) * 100, t);
+    for (const [bt, st] of bend) {
+      if (bt <= offset) continue;
+      const tt = t + (bt - offset) * spb;
+      if (tt > end + 0.05) break;
+      prm.linearRampToValueAtTime(base + st * 100, tt);
+    }
+  }
 }
 
 /** Start a voice. If `dur` is given the gate closes at time+dur (sequenced notes); otherwise
@@ -527,8 +679,10 @@ export function startVoice(ctx: BaseAudioContext, out: AudioNode, p: SynthPatch,
     case 'noise': b = buildNoise(ctx, p, midi, vel, time, kill, o, gateOff); break;
     case 'glitch': b = buildGlitch(ctx, p, midi, vel, time, kill, o); break;
     case 'drums': b = buildDrum(ctx, p, midi, vel, time, kill); break;
+    case 'image': b = buildImage(ctx, p, midi, vel, time, kill, o, gateOff); break;
     default: b = buildSub(ctx, p, midi, vel, time, kill, o, gateOff);
   }
+  if (o.bend && o.bend.length > 1 && b.pitch.length) applyBend(b.pitch, o.bend, time, o.spb ?? 0.5, o.bendOffset ?? 0, gateOff);
   const stopAll = (t: number) => {
     for (const s of b.sources) { try { s.stop(t); } catch { /* already stopped */ } }
   };

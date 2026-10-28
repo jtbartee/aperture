@@ -138,7 +138,7 @@ export function planSections(c: CompositionSettings, bb: number, r: Rng): Sectio
 /** Drawing as a guide curve: stroke density → "edges/texture", mean height → contour/brightness. */
 export function drawingCurve(strokes: Stroke[], beats: number, steps = 128): Curve {
   const mk = () => new Float32Array(steps);
-  const cv: Curve = { n: steps, brightness: mk(), saturation: mk(), hue: mk(), hueStrength: mk(), contrast: mk(), edges: mk(), texture: mk(), variation: mk(), centroid: mk(), orientation: mk(), profile: [] };
+  const cv: Curve = { n: steps, brightness: mk(), saturation: mk(), hue: mk(), hueStrength: mk(), contrast: mk(), edges: mk(), texture: mk(), variation: mk(), centroid: mk(), orientation: mk(), periodicity: mk(), profile: [] };
   const sums = new Float32Array(steps), cnt = new Float32Array(steps);
   for (const s of strokes) for (const p of s.points) {
     const j = Math.max(0, Math.min(steps - 1, Math.floor((p.x / Math.max(1, beats)) * steps)));

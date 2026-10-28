@@ -1,4 +1,5 @@
 import { zipSync } from 'fflate';
+import { drawContours } from './contourDraw';
 import { useStore } from '../state/store';
 import { projectToMidi } from '../export/midi';
 import { packProject, referencedAssets, unpackProject } from '../export/projectFile';
@@ -110,11 +111,7 @@ export async function exportOverlay(kind: 'image' | 'panorama') {
   ctx.drawImage(lv.display, 0, 0);
   ctx.fillStyle = 'rgba(0,0,0,0.3)';
   ctx.fillRect(0, 0, W, H);
-  if (a) {
-    ctx.strokeStyle = 'rgba(224,164,88,0.95)';
-    ctx.lineWidth = 2;
-    for (const g of a.gestures) { ctx.beginPath(); g.points.forEach((q, i) => (i ? ctx.lineTo(q.x * W, (1 - q.y) * H) : ctx.moveTo(q.x * W, (1 - q.y) * H))); ctx.stroke(); }
-  }
+  if (a) drawContours(ctx, a.contours, { X: (x) => x * W, Y: (y) => (1 - y) * H, sx: W, sy: H, width: 2, junctions: true });
   const beats = kind === 'image' ? p.image!.settings.bars * barBeats(p.settings.timeSig) : projectBeats(p.settings);
   for (const t of p.tracks.filter((x) => x.generator?.startsWith(kind === 'image' ? 'image:' : 'pano:'))) {
     const pitches = allowedPitches(t.pitch, p.settings.key, p.settings.scale, p.settings.customScale);

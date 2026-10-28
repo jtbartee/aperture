@@ -11,6 +11,7 @@ import { IDice } from '../components/icons';
 import { uid } from '../../core/ids';
 import { rng, hash32 } from '../../core/rng';
 import { SUBDIVISIONS } from '../../theory/rhythm';
+import { ContourControls, ShapeControls, SynthControls } from './SonifyPanels';
 
 const ROLES: Role[] = ['pad', 'melody', 'bass', 'drone', 'percussion', 'texture', 'arp', 'chords'];
 const feat = FEATURE_KEYS.map((f) => ({ value: f.id, label: f.label }));
@@ -87,15 +88,15 @@ export function ImagePanel() {
   const s = img.settings;
   const set = (patch: Partial<typeof s>, regen = true) => st.setImageSettings(patch, regen);
   const layers = project.tracks.filter((t) => t.generator?.startsWith('image:'));
-  const analysed = !!getAnalysis(img.asset.assetId);
+  const a = getAnalysis(img.asset.assetId);
+  const analysed = !!a;
   return (
     <>
       <Section title="Interpretation">
-        <Seg value={s.mode} onChange={(v: ImageMode) => set({ mode: v })} options={[{ value: 'contour', label: 'A Contour', title: 'Edges and contours become melodic gestures' }, { value: 'color', label: 'B Colour', title: 'Colour, light and texture drive notes and instruments' }, { value: 'atmos', label: 'C Atmos', title: 'Large-scale structure becomes pads, drones and slow movement' }, { value: 'hybrid', label: 'Hybrid', title: 'Several engines generate separate layers' }]} />
-        <p className="note">{({ contour: 'Sobel edges → non-maximum suppression → hysteresis → connected components → x-monotone gestures. x = time, y = pitch; length, thickness, curvature and edge strength shape duration, articulation and velocity.', color: 'Per time-step colour statistics. Each musical parameter reads the image feature you assign below; hue sectors route notes to colour voices you choose.', atmos: 'Regional profiles set chords (hue → degree, saturation → colour), drone register (brightness), onset density (edges), reverb and filter movement.', hybrid: 'Contours → melody, bottom-third structure → bass, colour regions → pads, fine texture → percussion, brightness → filter automation.' } as const)[s.mode]}</p>
+        <Seg value={s.mode} onChange={(v: ImageMode) => set({ mode: v })} options={[{ value: 'contour', label: 'A Contour', title: 'Traced contours become independent voices' }, { value: 'color', label: 'B Colour', title: 'Colour, light and texture drive notes and instruments' }, { value: 'atmos', label: 'C Atmos', title: 'Large-scale structure becomes pads, drones and slow movement' }, { value: 'hybrid', label: 'Hybrid', title: 'Contour voices plus an evolving atmosphere and optional classic layers' }]} />
+        <p className="note">{({ contour: 'Each traced contour is a voice: x = time, height = pitch, edge strength = velocity, curvature = articulation, thickness = timbre. Loops and paths that double back become simultaneous lines; gaps are silence. The most salient contours are voices A–C, the rest form a field.', color: 'Per time-step colour statistics. Each musical parameter reads the image feature you assign below; hue sectors route notes to colour voices you choose. Outside metric rhythm, notes only start where the image changes.', atmos: 'Regional profiles set chords (hue → degree, saturation → colour), drone register (brightness), onset density (edges), reverb and filter movement.', hybrid: 'Contour voices + an evolving image-synth atmosphere + the rhythm layer; low-structure bass and colour pads can be added below.' } as const)[s.mode]}</p>
         <Slider label="Length" value={s.bars} min={2} max={64} step={1} onStart={st.checkpoint} onChange={(v) => set({ bars: v }, false)} onCommit={() => st.generateImage()} fmt={(v) => `${v} bars`} />
-        <Slider label="Density" value={s.density} min={0} max={1} onStart={st.checkpoint} onChange={(v) => set({ density: v }, false)} onCommit={() => st.generateImage()} />
-        <Slider label="Smoothing" value={s.smoothing} min={0} max={1} onStart={st.checkpoint} onChange={(v) => set({ smoothing: v }, false)} onCommit={() => st.generateImage()} />
+        <Slider label="Feature smoothing" title="Smoothing of the colour / light / texture curves" value={s.smoothing} min={0} max={1} onStart={st.checkpoint} onChange={(v) => set({ smoothing: v }, false)} onCommit={() => st.generateImage()} />
         <div className="btnrow">
           <button className="btn primary small" disabled={!analysed} onClick={() => st.generateImage()}>Generate</button>
           <button className="btn small" disabled={!analysed} onClick={() => { set({ seed: (s.seed % 9999) + 1 }, true); }} title="New seed: same image, a different but related reading"><IDice size={13} /> Regenerate</button>
@@ -106,15 +107,9 @@ export function ImagePanel() {
         <SwitchAt />
         <Locks />
       </Section>
-      {(s.mode === 'contour' || s.mode === 'hybrid') && (
-        <Section title="Contour analysis">
-          <Slider label="Edge sensitivity" value={s.edgeSensitivity} min={0} max={1} onStart={st.checkpoint} onChange={(v) => set({ edgeSensitivity: v }, false)} onCommit={() => set({}, true)} />
-          <Slider label="Min contour" value={s.minContour} min={4} max={200} step={1} onStart={st.checkpoint} onChange={(v) => set({ minContour: v }, false)} onCommit={() => set({}, true)} fmt={(v) => `${v} px`} />
-          <Slider label="Detail" value={s.detail} min={0} max={1} onStart={st.checkpoint} onChange={(v) => set({ detail: v }, false)} onCommit={() => set({}, true)} />
-          <Slider label="Note grouping" value={s.grouping} min={0} max={1} onStart={st.checkpoint} onChange={(v) => set({ grouping: v }, false)} onCommit={() => st.generateImage()} title="High = join same-pitch steps into longer notes" />
-          <p className="note">{getAnalysis(img.asset.assetId)?.gestures.length ?? 0} gestures found. Sensitivity/length/detail changes re-run only the contour stage.</p>
-        </Section>
-      )}
+      <ShapeControls s={s} set={set} />
+      <ContourControls c={s.contour} stats={a?.contours} set={(patch, regen) => set({ contour: { ...useStore.getState().project.image!.settings.contour, ...patch } }, regen)} />
+      <SynthControls s={s} set={set} />
       {s.mode === 'color' && (
         <Section title="Feature → music mapping">
           <table className="grid"><tbody>
@@ -132,10 +127,10 @@ export function ImagePanel() {
           <p className="note">No colour stereotypes are built in — route any hue to any voice, and change each voice's instrument in the Track tab.</p>
         </Section>
       )}
-      {s.mode === 'hybrid' && (
-        <Section title="Hybrid layers">
+      {(s.mode === 'hybrid' || s.mode === 'contour') && (
+        <Section title={s.mode === 'hybrid' ? 'Hybrid layers' : 'Layers'}>
           <div className="row2">
-            {(['contour', 'bass', 'pads', 'percussion', 'filter'] as const).map((k) => <Check key={k} label={{ contour: 'Contours → melody', bass: 'Structure → bass', pads: 'Colour → pads', percussion: 'Texture → percussion', filter: 'Brightness → filter' }[k]} checked={s.hybrid[k]} onChange={(v) => set({ hybrid: { ...s.hybrid, [k]: v } })} />)}
+            {(s.mode === 'hybrid' ? (['contour', 'atmosphere', 'percussion', 'bass', 'pads', 'filter'] as const) : (['percussion'] as const)).map((k) => <Check key={k} label={{ contour: 'Contours → voices', atmosphere: 'Evolving atmosphere', bass: 'Structure → bass (classic)', pads: 'Colour → pads (classic)', percussion: `Rhythm layer (${({ free: 'visual events', texture: 'image texture', metric: 'drum kit' } as const)[s.rhythm]})`, filter: 'Brightness → filter' }[k]} checked={s.hybrid[k]} onChange={(v) => set({ hybrid: { ...s.hybrid, [k]: v } })} />)}
           </div>
         </Section>
       )}
@@ -199,15 +194,23 @@ export function PanoramaPanel() {
         {s.direction === 'path' && <p className="note">{s.path.length > 1 ? `${s.path.length}-point path. ` : 'No path yet. '}Use the <b>path</b> tool on the image to draw one. {s.path.length > 1 && <button className="btn small" onClick={() => set({ path: [] })}>Clear path</button>}</p>}
         <Seg label="Speed" value={0} onChange={(m: number) => { if (m) st.setSettings({ bpm: Math.max(30, Math.min(300, Math.round(project.settings.bpm * m))) }); }} options={[{ value: 0.5, label: '×½' }, { value: 0.8, label: '×0.8' }, { value: 1.25, label: '×1.25' }, { value: 2, label: '×2' }]} />
       </Section>
+      <Section title="Sonification layers">
+        <div className="row2">
+          {(['contours', 'atmosphere', 'events', 'regions'] as const).map((k) => <Check key={k} label={{ contours: 'Contour voices (ridges → drone, melody, texture)', atmosphere: 'Evolving atmosphere', events: `Rhythm layer (${({ free: 'visual events', texture: 'image texture', metric: 'drum kit' } as const)[s.rhythm]})`, regions: 'Region roles (classic)' }[k]} checked={s.layers[k]} onChange={(v) => st.setPanoramaSettings({ layers: { ...s.layers, [k]: v } }, true)} />)}
+        </div>
+        <Check label="Live feature readout" checked={s.readout} onChange={(v) => set({ readout: v })} />
+      </Section>
+      <ShapeControls s={s} set={(patch, regen) => st.setPanoramaSettings(patch, regen)} />
+      <ContourControls c={s.contour} stats={getAnalysis(pano.asset.assetId)?.contours} set={(patch, regen) => st.setPanoramaSettings({ contour: { ...useStore.getState().project.panorama!.settings.contour, ...patch } }, regen)} />
+      <SynthControls s={s} set={(patch, regen) => st.setPanoramaSettings(patch, regen)} />
       <Section title="Analysis → events">
         <Slider label="Scan resolution" value={s.scanResolution} min={16} max={1024} step={16} onStart={st.checkpoint} onChange={(v) => set({ scanResolution: v })} fmt={(v) => `${v}`} title="How many strips are sampled across the image — more = more musical detail" />
         <Slider label="Strip width" value={s.stripWidth} min={0} max={3} onStart={st.checkpoint} onChange={(v) => set({ stripWidth: v })} />
-        <Slider label="Sensitivity" value={s.sensitivity} min={0} max={1} onStart={st.checkpoint} onChange={(v) => set({ sensitivity: v })} />
-        <Slider label="Density" value={s.density} min={0} max={1} onStart={st.checkpoint} onChange={(v) => set({ density: v })} />
+        <Slider label="Feature sensitivity" title="Edge density measured along the scan (feature curves, region roles)" value={s.sensitivity} min={0} max={1} onStart={st.checkpoint} onChange={(v) => set({ sensitivity: v })} />
         <Slider label="Note threshold" value={s.threshold} min={0} max={1} onStart={st.checkpoint} onChange={(v) => set({ threshold: v })} />
         <Slider label="Smoothing" value={s.smoothing} min={0} max={1} onStart={st.checkpoint} onChange={(v) => set({ smoothing: v })} />
         <Slider label="Polyphony" value={s.polyphony} min={2} max={6} step={1} onStart={st.checkpoint} onChange={(v) => set({ polyphony: v })} fmt={(v) => String(v)} />
-        <Select label="Quantize" value={s.quantize} onChange={(v) => set({ quantize: v })} options={[{ value: 0, label: 'Off' }, ...SUBDIVISIONS.map((d) => ({ value: d.steps, label: d.label }))]} />
+        {s.rhythm === 'metric' && <Select label="Quantize (region roles)" value={s.quantize} onChange={(v) => set({ quantize: v })} options={[{ value: 0, label: 'Off' }, ...SUBDIVISIONS.map((d) => ({ value: d.steps, label: d.label }))]} />}
         <div className="btnrow">
           <button className="btn primary small" onClick={() => st.generatePanorama()}>Generate</button>
           <button className="btn small" onClick={() => { set({ seed: (s.seed % 9999) + 1 }); st.generatePanorama(); }}><IDice size={13} /> Regenerate</button>
@@ -217,7 +220,7 @@ export function PanoramaPanel() {
         <SwitchAt />
         <Locks />
       </Section>
-      <Section title="Regions → roles" right={<button className="btn small" onClick={() => st.setRegions([...pano.regions, { id: uid('reg'), name: `Region ${pano.regions.length + 1}`, role: 'texture', band: { y0: 0.4, y1: 0.6 }, trackId: '', enabled: true }])}>+ Region</button>}>
+      {s.layers.regions && <Section title="Regions → roles" right={<button className="btn small" onClick={() => st.setRegions([...pano.regions, { id: uid('reg'), name: `Region ${pano.regions.length + 1}`, role: 'texture', band: { y0: 0.4, y1: 0.6 }, trackId: '', enabled: true }])}>+ Region</button>}>
         <p className="note">Regions are image coordinates — bands or painted/lasso masks — never guessed objects. Choose “paint” for a region, then use the paint, erase or lasso tool on the image.</p>
         {pano.regions.map((r) => (
           <div key={r.id} className="fx">
@@ -242,7 +245,7 @@ export function PanoramaPanel() {
             </div>
           </div>
         ))}
-      </Section>
+      </Section>}
       <Section title="Panorama layers">
         {layers.map((t) => <LayerRow key={t.id} t={t} />)}
         {!layers.length && <p className="note">Generate to create one layer per enabled region.</p>}

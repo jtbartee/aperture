@@ -70,7 +70,7 @@ export async function renderOffline(project: Project, o: RenderOptions): Promise
   };
 
   for (const ch of graph.channels.values()) ch.resetAutomation(0);
-  for (const ev of chaseNotes(p, o.from, only)) graph.trigger(ev.track, ev.note, 0, (ev.endBeat - o.from) / bps);
+  for (const ev of chaseNotes(p, o.from, only)) graph.trigger(ev.track, ev.note, 0, (ev.endBeat - o.from) / bps, o.from);
   scheduleChunk(0, CHUNK);
 
   let cancelled = false;

@@ -2,7 +2,7 @@
 // which image feature drives which musical decision. Curves are indexed by musical time
 // (index 0 = start of the scan), whatever the scan direction or path.
 
-import type { AutomationLane, ModTarget, NoteEvent, NoteOrigin, ProjectSettings, Role, Track } from '../core/types';
+import type { AutomationLane, ModTarget, NoteEvent, NoteOrigin, ProjectSettings, RhythmMode, Role, Track } from '../core/types';
 import type { Rng } from '../core/rng';
 import { type Curve, type CurveKey, curveValue } from '../analysis/features';
 import { barBeats, metricWeight } from '../core/time';
@@ -16,6 +16,8 @@ export interface RoleParams {
   threshold: number; // 0..1 event threshold
   polyphony: number; // max simultaneous notes
   quantize: number; // steps per beat (0 = free)
+  /** 'metric' (default) keeps the bar grid; 'free'/'texture' place events where the image changes */
+  rhythm?: RhythmMode;
 }
 
 export interface RoleInput {
@@ -71,10 +73,13 @@ const at = (cv: Curve, key: CurveKey, beat: number, beats: number) => curveValue
 function melodyRole(i: RoleInput): RoleOutput {
   const ctx = mk(i);
   const { add, pitches } = ctx;
+  const free = (i.params.rhythm ?? 'metric') !== 'metric';
   const sub = i.params.quantize || (i.params.density > 0.55 ? 4 : 2);
-  const step = 1 / sub;
+  // free time: one candidate per scan step (the image's own resolution), no metric weighting
+  const step = free ? Math.max(1 / 16, i.beats / i.curve.n) : 1 / sub;
   const [y0, y1] = i.yRange ?? [0, 1];
   const bb = barBeats(i.settings.timeSig);
+  const weight = (b: number) => (free ? 0 : metricWeight(i.settings.timeSig, b % bb));
   let last = -Infinity;
   const minGap = step * (1 + Math.round((1 - i.params.density) * 3));
   const onsets: { beat: number; y: number; vel: number }[] = [];
@@ -82,7 +87,7 @@ function melodyRole(i: RoleInput): RoleOutput {
     const e = at(i.curve, 'edges', b, i.beats);
     const v = at(i.curve, 'variation', b, i.beats);
     const c = at(i.curve, 'contrast', b, i.beats);
-    const mw = metricWeight(i.settings.timeSig, b % bb);
+    const mw = weight(b);
     const energy = (e * 1.2 + v * 1.4 + c * 0.5) * (0.6 + i.params.density * 0.9) + mw * 0.12;
     if (energy < i.params.threshold * 0.9 || b - last < minGap) continue;
     // pitch from the brightest row of the strip's profile, blended with the centroid
@@ -107,7 +112,7 @@ function melodyRole(i: RoleInput): RoleOutput {
     let off = 0;
     const slot = chordAt(i.harmony, o.beat);
     const midi = mapY(o.y, pitches);
-    if (slot && metricWeight(i.settings.timeSig, o.beat % bb) >= 0.5 && !slot.chord.pcs.includes(midi % 12)) {
+    if (slot && weight(o.beat) >= 0.5 && !slot.chord.pcs.includes(midi % 12)) {
       if (slot.chord.pcs.includes(mapY(o.y, pitches, 1) % 12)) off = 1;
       else if (slot.chord.pcs.includes(mapY(o.y, pitches, -1) % 12)) off = -1;
     }
@@ -237,6 +242,7 @@ function arpRole(i: RoleInput): RoleOutput {
  *  strong beat + contrast → kick, group off-beats with edges → snare/click, fine texture → hats,
  *  sudden change → noise burst / open hat, saturated vertical edges → metal. */
 function percRole(i: RoleInput): RoleOutput {
+  if ((i.params.rhythm ?? 'metric') !== 'metric') return eventPercRole(i);
   const ctx = mk(i);
   const bb = barBeats(i.settings.timeSig);
   const sub = i.params.quantize || 4;
@@ -257,6 +263,30 @@ function percRole(i: RoleInput): RoleOutput {
     if (t * (0.5 + d) > i.params.threshold * 0.45 && i.rng.chance(0.35 + t * 0.5)) hit(42, 0.3 + t * 0.4 + (mw > 0.3 ? 0.1 : 0));
     if (v > 0.45 && i.rng.chance(v * 0.6)) hit(i.rng.chance(0.5) ? 39 : 46, 0.5 + v * 0.3, step * 2);
     if (s > 0.5 && o > 0.6 && mw < 0.5 && i.rng.chance(s * 0.25 * d)) hit(56, 0.45 + s * 0.3);
+  }
+  return { notes: ctx.notes, automation: [] };
+}
+
+/** PERCUSSION without a grid: hits sit on the curve's own peaks (edges, change, texture) — local
+ *  maxima above absolute thresholds, so smooth stretches stay silent and nothing repeats unless the
+ *  image does. The drum voice is chosen from what the image is doing at that moment. */
+function eventPercRole(i: RoleInput): RoleOutput {
+  const ctx = mk(i);
+  const n = i.curve.n;
+  const step = i.beats / n;
+  const d = i.params.density;
+  const score = (j: number) => i.curve.edges[j] * 1.1 + i.curve.variation[j] * 1.5 + i.curve.texture[j] * 0.4;
+  let last = -Infinity;
+  const gap = Math.max(1 / 16, (1 - d) * 0.75);
+  for (let j = 1; j < n - 1; j++) {
+    const v = score(j);
+    if (v < score(j - 1) || v < score(j + 1) || v < 0.18 + i.params.threshold * 0.4 * (1.2 - d)) continue;
+    const b = j * step;
+    if (b - last < gap) continue;
+    last = b;
+    const c = i.curve.contrast[j], br = i.curve.brightness[j], t = i.curve.texture[j], o = i.curve.orientation[j], s = i.curve.saturation[j];
+    const midi = c > 0.4 && br < 0.35 ? 36 : i.curve.variation[j] > 0.45 ? (o > 0.55 ? 39 : 46) : t > 0.5 ? 42 : s > 0.5 && o > 0.6 ? 56 : o > 0.55 ? 38 : 37;
+    ctx.add({ start: b, dur: midi === 46 || midi === 39 ? 0.5 : 0.125, midi, vel: 0.4 + Math.min(0.55, v * 0.5) });
   }
   return { notes: ctx.notes, automation: [] };
 }

@@ -5,13 +5,15 @@ import { barBeats } from '../../core/time';
 import { allowedPitches, yForMidi } from '../../theory/scales';
 import { EDGE_BINS } from '../../analysis/features';
 import { hexA, useStageCanvas } from '../canvas';
+import { drawContours } from '../contourDraw';
 import { Progress } from '../components/controls';
 import { loadProceduralImage } from '../../state/factory';
 
 export function ImageView() {
   const project = useStore((s) => s.project);
   const ui = useStore((s) => s.ui);
-  const [layers, setLayers] = useState({ contours: true, notes: true, heat: false });
+  const [view, setView] = useState<'photo' | 'contours' | 'overlay'>('overlay');
+  const [layers, setLayers] = useState({ notes: true, heat: false, junctions: true });
   const fileRef = useRef<HTMLInputElement>(null);
   const geom = useRef({ x: 0, y: 0, w: 0, h: 0 });
   const img = project.image;
@@ -29,10 +31,9 @@ export function ImageView() {
     const dw = iw * s, dh = ih * s;
     const x0 = (w - dw) / 2, y0 = (h - dh) / 2;
     geom.current = { x: x0, y: y0, w: dw, h: dh };
-    if (lv) ctx.drawImage(lv.display, x0, y0, dw, dh);
-    else { ctx.fillStyle = '#1a1c20'; ctx.fillRect(x0, y0, dw, dh); }
-    ctx.fillStyle = 'rgba(0,0,0,0.25)';
-    ctx.fillRect(x0, y0, dw, dh);
+    if (view === 'contours' || !lv) { ctx.fillStyle = '#16181c'; ctx.fillRect(x0, y0, dw, dh); }
+    else ctx.drawImage(lv.display, x0, y0, dw, dh);
+    if (view === 'overlay') { ctx.fillStyle = 'rgba(0,0,0,0.42)'; ctx.fillRect(x0, y0, dw, dh); }
     if (a && layers.heat) {
       const g = a.grid;
       const thr = 3;
@@ -43,17 +44,17 @@ export function ImageView() {
         ctx.fillRect(x0 + (c / g.cols) * dw, y0 + (r / g.rows) * dh, dw / g.cols + 0.5, dh / g.rows + 0.5);
       }
     }
-    if (a && layers.contours) {
-      ctx.lineWidth = 1.6;
-      a.gestures.forEach((gst, i) => {
-        ctx.strokeStyle = i < Math.ceil(a.gestures.length * 0.4) ? 'rgba(224,164,88,0.9)' : 'rgba(154,208,201,0.75)';
-        ctx.beginPath();
-        gst.points.forEach((pt, k) => { const X = x0 + pt.x * dw, Y = y0 + (1 - pt.y) * dh; if (k) ctx.lineTo(X, Y); else ctx.moveTo(X, Y); });
-        ctx.stroke();
-      });
-    }
     const beats = p.image.settings.bars * barBeats(p.settings.timeSig);
-    if (layers.notes) {
+    const pos = engine.position();
+    // the contours whose notes are sounding at the playhead (traceable sight ↔ sound)
+    const active = new Set<string>();
+    const sounding: [number, number, string][] = [];
+    for (const t of p.tracks) {
+      if (!t.generator?.startsWith('image:') || t.mix.mute) continue;
+      for (const n of t.notes) if (n.start <= pos && n.start + n.dur > pos) { if (n.cid) active.add(n.cid); if (n.src) sounding.push([n.src[0], n.src[1], t.color]); }
+    }
+    if (a && view !== 'photo') drawContours(ctx, a.contours, { X: (x) => x0 + x * dw, Y: (y) => y0 + (1 - y) * dh, sx: dw, sy: dh, active, junctions: layers.junctions, width: view === 'contours' ? 2 : 1.8 });
+    if (layers.notes && view !== 'contours') {
       for (const t of p.tracks) {
         if (!t.generator?.startsWith('image:') && !t.notes.some((n) => n.origin === 'image')) continue;
         const pitches = allowedPitches(t.pitch, p.settings.key, p.settings.scale, p.settings.customScale);
@@ -62,20 +63,26 @@ export function ImageView() {
           const y = n.pitchY ?? yForMidi(n.midi, pitches);
           const X = x0 + (n.start / beats) * dw;
           const Y = y0 + (1 - y) * dh;
-          ctx.fillStyle = hexA(t.color, n.origin === 'user' ? 1 : 0.85);
-          ctx.fillRect(X, Y - 2, Math.max(2, (n.dur / beats) * dw), 4);
+          ctx.fillStyle = hexA(t.color, n.origin === 'user' ? 1 : 0.55);
+          ctx.fillRect(X, Y - 1.5, Math.max(2, (n.dur / beats) * dw), 3);
           if (n.origin === 'user') { ctx.strokeStyle = '#fff'; ctx.strokeRect(X - 0.5, Y - 2.5, Math.max(2, (n.dur / beats) * dw) + 1, 5); }
         }
       }
     }
-    const pos = engine.position();
     if (pos <= beats) {
       const X = x0 + (pos / beats) * dw;
       ctx.strokeStyle = '#f2c27b';
       ctx.lineWidth = 2;
       ctx.beginPath(); ctx.moveTo(X, y0); ctx.lineTo(X, y0 + dh); ctx.stroke();
+      // each sounding note marks the image point it was read from
+      for (const [sx, sy, col] of sounding) {
+        ctx.fillStyle = col;
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 1.2;
+        ctx.beginPath(); ctx.arc(x0 + sx * dw, y0 + (1 - sy) * dh, 4, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      }
     }
-  }, [project, ui, layers]);
+  }, [project, ui, layers, view]);
 
   const onDown = (e: React.PointerEvent) => {
     const p = useStore.getState().project;
@@ -115,10 +122,15 @@ export function ImageView() {
   }
   return (
     <>
-      <canvas ref={ref} onPointerDown={onDown} role="img" aria-label={`Image ${img.asset.name} with analysis overlays. Click to seek; Alt-click a note to delete it.`} />
-      <div className="hud">{img.asset.name} · {img.asset.width}×{img.asset.height} · {img.settings.bars} bars · click = seek · alt-click note = delete</div>
-      <div className="hud hud-r" style={{ pointerEvents: 'auto', display: 'flex', gap: 8 }}>
-        {(['contours', 'notes', 'heat'] as const).map((k) => (
+      <canvas ref={ref} onPointerDown={onDown} role="img" aria-label={`Image ${img.asset.name}, ${view === 'photo' ? 'original photograph' : view === 'contours' ? 'extracted contours' : 'photograph with contour overlay'}. Click to seek; Alt-click a note to delete it.`} />
+      <div className="hud" style={{ ['--hud-r-w' as string]: '480px' }}>{img.asset.name} · {img.asset.width}×{img.asset.height} · {img.settings.bars} bars · {getAnalysis(img.asset.assetId)?.contours.contours.length ?? 0} contours · click = seek · alt-click note = delete</div>
+      <div className="hud hud-r" style={{ pointerEvents: 'auto', display: 'flex', gap: 8, alignItems: 'center' }}>
+        <span className="seg" role="group" aria-label="Image view">
+          {([['photo', 'Photo'], ['contours', 'Contours'], ['overlay', 'Overlay']] as const).map(([k, label]) => (
+            <button key={k} type="button" aria-pressed={view === k} data-view={k} onClick={() => setView(k)} title={k === 'photo' ? 'Original photograph' : k === 'contours' ? 'Extracted contours only' : 'Photograph with contour overlay'}>{label}</button>
+          ))}
+        </span>
+        {(['notes', 'junctions', 'heat'] as const).map((k) => (
           <label key={k} className="check"><input type="checkbox" checked={layers[k]} onChange={(e) => setLayers({ ...layers, [k]: e.target.checked })} />{k === 'heat' ? 'edge density' : k}</label>
         ))}
       </div>

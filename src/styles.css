@@ -78,6 +78,7 @@ select.sel { padding-right: 4px; max-width: 100%; }
 .stage .overlay-msg.passive .card { pointer-events: none; opacity: 0.9; }
 .stage .overlay-msg h2 { margin: 0 0 8px; font-size: 17px; color: var(--text); font-weight: 600; }
 .stage .hud { position: absolute; left: 10px; bottom: 8px; font: 11px var(--mono); color: var(--text-2); background: rgba(15,16,18,0.75); padding: 3px 7px; border-radius: 4px; pointer-events: none; }
+.stage .hud:not(.hud-r) { max-width: calc(100% - var(--hud-r-w, 380px) - 30px); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .stage .hud-r { left: auto; right: 10px; }
 .drop-hint { position: absolute; inset: 10px; border: 2px dashed var(--accent); border-radius: 12px; display: grid; place-items: center; color: var(--accent); background: rgba(224,164,88,0.06); pointer-events: none; font-size: 15px; }
 
@@ -200,3 +201,10 @@ kbd { font: 11px var(--mono); background: var(--panel-3); border: 1px solid var(
   body { overflow: auto; }
   .bottom-body { height: 180px; }
 }
+
+/* sonification controls */
+.scale-ends { display: flex; justify-content: space-between; margin: -4px 0 6px calc(var(--lbl-w, 96px) + 8px); font-size: 10px; color: var(--text-3); }
+table.synthmap td { padding: 2px 3px; vertical-align: middle; font-size: 11px; }
+table.synthmap input[type=range] { width: 100%; }
+.harm { display: flex; align-items: flex-end; gap: 1px; height: 28px; flex: 1; min-width: 0; }
+.harm span { flex: 1; min-width: 1px; border-radius: 1px 1px 0 0; }
