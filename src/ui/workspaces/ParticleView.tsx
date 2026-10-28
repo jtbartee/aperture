@@ -1,6 +1,6 @@
 import { useMemo, useRef } from 'react';
 import { engine, useStore } from '../../state/store';
-import { simulateParticles } from '../../interpret/particles';
+import { defaultZoneBehavior, simulateParticles, ZONE_BEHAVIORS } from '../../interpret/particles';
 import { hexA, useStageCanvas } from '../canvas';
 import { uid } from '../../core/ids';
 import { barBeats } from '../../core/time';
@@ -29,7 +29,8 @@ export function ParticleView() {
       ctx.strokeRect(x0 + z.x * s, y0 + z.y * s, z.w * s, z.h * s);
       ctx.fillStyle = '#c9c6bf';
       ctx.font = '11px ui-sans-serif, system-ui';
-      ctx.fillText(t?.name ?? '?', x0 + z.x * s + 4, y0 + z.y * s + 13);
+      const beh = t?.pitch.mode === 'drums' ? 'percussion' : z.behavior ?? 'free';
+      ctx.fillText(`${t?.name ?? '?'} · ${ZONE_BEHAVIORS.find((b) => b.id === beh)?.label ?? beh}`, x0 + z.x * s + 4, y0 + z.y * s + 13);
     }
     if (drag.current) {
       const { a, b } = drag.current;
@@ -74,10 +75,11 @@ export function ParticleView() {
           const w = Math.abs(d.b.x - d.a.x), h = Math.abs(d.b.y - d.a.y);
           if (w < 0.02 || h < 0.02) { invalidate(); return; }
           const st = useStore.getState();
-          st.commit((p) => ({ ...p, particles: { ...p.particles, zones: [...p.particles.zones, { id: uid('zone'), x: Math.min(d.a.x, d.b.x), y: Math.min(d.a.y, d.b.y), w, h, trackId: st.ui.selectedTrackId }] } }));
+          const track = st.project.tracks.find((t) => t.id === st.ui.selectedTrackId);
+          st.commit((p) => ({ ...p, particles: { ...p.particles, zones: [...p.particles.zones, { id: uid('zone'), x: Math.min(d.a.x, d.b.x), y: Math.min(d.a.y, d.b.y), w, h, trackId: st.ui.selectedTrackId, behavior: defaultZoneBehavior(track), repeat: 0.3 }] } }));
           st.regenerateParticles();
         }} />
-      {!project.particles.zones.length && <div className="overlay-msg passive"><div className="card"><h2>Particle sequencer</h2><p>Drag rectangles to create musical zones for the selected layer. Particles bounce deterministically (seeded); each time one enters a zone it plays a note — its height inside the zone sets the pitch, its speed the velocity.</p></div></div>}
+      {!project.particles.zones.length && <div className="overlay-msg passive"><div className="card"><h2>Particle sequencer</h2><p>Drag rectangles to create musical zones for the selected layer. Particles bounce deterministically (seeded); each time one enters a zone it plays a note — its height suggests the pitch, its speed the velocity, and the zone’s behaviour (chord tones, scale melody, arpeggio, pedal…) reads that event against the shared harmony.</p></div></div>}
       <div className="hud">{sim.count} particles · seed {project.particles.seed} · {project.particles.zones.length} zones · alt-click a zone to delete</div>
     </>
   );

@@ -1,5 +1,5 @@
 import { engine, selectedTrack, useStore } from '../../state/store';
-import type { Articulation, FeatureKey, ImageMode, ModTarget, Region, Role, ScanDirection, StructureId, StyleId, GenSource, Track } from '../../core/types';
+import type { Articulation, FeatureKey, ImageMode, ModTarget, OrbitalPitch, OrbitalVoice, Region, Role, ScanDirection, StructureId, StyleId, GenSource, Track, ZoneBehavior } from '../../core/types';
 import { Check, Num, Progress, Section, Seg, Select, Slider } from '../components/controls';
 import { STRUCTURES, STYLES, STYLE_IDS } from '../../interpret/composer';
 import { COLOR_VOICES } from '../../interpret/imageModes';
@@ -12,18 +12,24 @@ import { uid } from '../../core/ids';
 import { rng, hash32 } from '../../core/rng';
 import { SUBDIVISIONS } from '../../theory/rhythm';
 import { ContourControls, ShapeControls, SynthControls } from './SonifyPanels';
+import { SourceActions } from '../SourceActions';
+import { ZONE_BEHAVIORS } from '../../interpret/particles';
+import { defaultOrbitalVoice } from '../../interpret/orbital';
+import { PROGRESSION_TYPES } from '../../theory/progression';
+import { styleProgression } from '../../interpret/composer';
 
 const ROLES: Role[] = ['pad', 'melody', 'bass', 'drone', 'percussion', 'texture', 'arp', 'chords'];
 const feat = FEATURE_KEYS.map((f) => ({ value: f.id, label: f.label }));
 
 function Locks() {
   const c = useStore((s) => s.project.composition);
+  const hLock = useStore((s) => s.project.harmony.lock);
   const st = useStore.getState();
   const L = (k: keyof typeof c.locks, label: string, title: string) => <Check label={label} title={title} checked={c.locks[k]} onChange={(v) => st.setComposition({ locks: { ...c.locks, [k]: v } })} />;
   return (
     <div className="row2" style={{ margin: '6px 0' }}>
       {L('melody', 'Lock melody', 'Keep the generated melody when regenerating')}
-      {L('harmony', 'Lock harmony', 'Keep the chord progression')}
+      <Check label="Lock harmony" title="Keep the shared chord progression (Harmony tab) — every generator then follows it" checked={hLock} onChange={(v) => st.setHarmony({ lock: v })} />
       {L('rhythm', 'Lock rhythm', 'Keep onset times; take new pitches')}
       {L('instruments', 'Lock instruments', 'Keep each layer\'s sound when regenerating')}
       {L('selected', 'Lock selected notes', 'Notes you locked survive regeneration')}
@@ -64,6 +70,7 @@ export function BrushPanel() {
         <Seg label="Articulation" value={b.articulation} onChange={(v: Articulation) => setB({ articulation: v })} options={[{ value: 'normal', label: 'Norm' }, { value: 'staccato', label: 'Stacc' }, { value: 'accent', label: 'Acc' }, { value: 'tenuto', label: 'Ten' }]} />
         {b.kind === 'arpeggio' && <Seg label="Arp pattern" value={b.arpPattern} onChange={(v) => setB({ arpPattern: v })} options={[{ value: 'up', label: 'Up' }, { value: 'down', label: 'Down' }, { value: 'updown', label: 'Up-dn' }, { value: 'random', label: 'Rand' }]} />}
         {b.kind === 'modulation' && <Select label="Modulates" value={b.modTarget} options={MOD_TARGETS.map((m) => ({ value: m.id, label: m.label }))} onChange={(v: ModTarget) => setB({ modTarget: v })} />}
+        {b.kind !== 'modulation' && b.kind !== 'rhythm' && <Seg label="Harmony" value={b.harmony ?? 'scale'} onChange={(v: 'scale' | 'guided' | 'chord') => setB({ harmony: v })} options={[{ value: 'scale', label: 'Scale', title: 'Height → scale rows (the drawing decides every pitch)' }, { value: 'guided', label: 'Guided', title: 'Strong beats and long notes move to the nearest chord tone of the shared harmony' }, { value: 'chord', label: 'Chord', title: 'Every note becomes the nearest chord tone' }]} />}
         <div className="row2">
           <Check label="Quantize" checked={b.quantize} onChange={(v) => setB({ quantize: v })} />
           <Check label="Snap to scale" checked={b.snap} onChange={(v) => setB({ snap: v })} title="Off = chromatic rows (those notes then keep their exact pitch when the key changes)" />
@@ -92,6 +99,10 @@ export function ImagePanel() {
   const analysed = !!a;
   return (
     <>
+      <Section title={`Image · ${img.asset.name}`}>
+        <p className="note">{img.asset.width}×{img.asset.height} px · {(img.asset.bytes / 1e6).toFixed(1)} MB</p>
+        <div className="btnrow"><SourceActions kind="image" /></div>
+      </Section>
       <Section title="Interpretation">
         <Seg value={s.mode} onChange={(v: ImageMode) => set({ mode: v })} options={[{ value: 'contour', label: 'A Contour', title: 'Traced contours become independent voices' }, { value: 'color', label: 'B Colour', title: 'Colour, light and texture drive notes and instruments' }, { value: 'atmos', label: 'C Atmos', title: 'Large-scale structure becomes pads, drones and slow movement' }, { value: 'hybrid', label: 'Hybrid', title: 'Contour voices plus an evolving atmosphere and optional classic layers' }]} />
         <p className="note">{({ contour: 'Each traced contour is a voice: x = time, height = pitch, edge strength = velocity, curvature = articulation, thickness = timbre. Loops and paths that double back become simultaneous lines; gaps are silence. The most salient contours are voices A–C, the rest form a field.', color: 'Per time-step colour statistics. Each musical parameter reads the image feature you assign below; hue sectors route notes to colour voices you choose. Outside metric rhythm, notes only start where the image changes.', atmos: 'Regional profiles set chords (hue → degree, saturation → colour), drone register (brightness), onset density (edges), reverb and filter movement.', hybrid: 'Contour voices + an evolving image-synth atmosphere + the rhythm layer; low-structure bass and colour pads can be added below.' } as const)[s.mode]}</p>
@@ -170,6 +181,10 @@ export function PanoramaPanel() {
   const fmtT = (x: number) => `${Math.floor(x / 60)}:${String(Math.round(x % 60)).padStart(2, '0')}`;
   return (
     <>
+      <Section title={`Panorama · ${pano.asset.name}`}>
+        <p className="note">{pano.asset.width}×{pano.asset.height} px · {(pano.asset.bytes / 1e6).toFixed(1)} MB</p>
+        <div className="btnrow"><SourceActions kind="panorama" /></div>
+      </Section>
       <Section title="Scan timing">
         <Seg label="Timing" value={s.timing} onChange={(v) => set({ timing: v })} options={[{ value: 'free', label: 'Free time', title: 'Completes the scan in a fixed number of seconds' }, { value: 'beat', label: 'Beat sync', title: 'Maps the whole image to a number of bars' }]} />
         {s.timing === 'free' ? (
@@ -274,6 +289,9 @@ export function GenerativePanel() {
         <Slider label="Length" value={c.bars} min={4} max={256} step={1} onStart={st.checkpoint} onChange={(v) => st.commit((p) => ({ ...p, composition: { ...p.composition, bars: v } }), false)} fmt={(v) => `${v} bars`} />
         <div className="row"><span className="lbl">Seed</span><span style={{ display: 'flex', gap: 6 }}><Num label="" value={c.seed} min={1} max={999999} onChange={(v) => set({ seed: v })} width={80} /><button className="btn small" title="Random seed" onClick={() => set({ seed: 1 + Math.floor(Math.random() * 99999) })}><IDice size={13} /></button></span></div>
         {c.style === 'atonal' && <Check label="Bypass the scale (chromatic pitch sets)" checked={c.bypassScale} onChange={(v) => set({ bypassScale: v })} />}
+        <Seg label="Time" value={c.time} onChange={(v: 'metric' | 'free') => set({ time: v })} options={[{ value: 'metric', label: 'Metric', title: 'Bars, beats and rhythmic patterns' }, { value: 'free', label: 'Free time', title: 'No grid and no pulse: phrases breathe; no drums' }]} />
+        <Check label="Percussion layer" title="Off = no drums in any style" checked={c.percussion && c.time !== 'free'} onChange={(v) => set({ percussion: v })} />
+        <p className="note">Harmony: {project.harmony.progression === 'auto' ? `${PROGRESSION_TYPES.find((x) => x.id === styleProgression(c.style, project.harmony, c))?.label} (style)` : PROGRESSION_TYPES.find((x) => x.id === project.harmony.progression)?.label} · {project.harmony.behavior}{project.harmony.lock ? ' · locked' : ''} — <button className="linkish" onClick={() => st.setUi({ inspectorTab: 'harmony' })}>Harmony tab</button></p>
         <div className="btnrow">
           <button className="btn primary" onClick={() => st.generateComposition(undefined, true)} title="Generate and adopt the style's tempo">Generate</button>
           <button className="btn" onClick={() => st.generateComposition(undefined, false)} title="Generate keeping the current tempo">Generate (keep tempo)</button>
@@ -336,21 +354,54 @@ function GenModulation() {
   );
 }
 
+const ORBITAL_PITCH: { value: OrbitalPitch; label: string; title: string }[] = [
+  { value: 'scale', label: 'Scale', title: 'Radius → scale rows; the figure never changes (the original mapping)' },
+  { value: 'guided', label: 'Guided', title: 'Strong beats and long notes move to the nearest chord tone when the chords change' },
+  { value: 'chord', label: 'Chord', title: 'Every note is the chord tone nearest its radius' },
+  { value: 'chromatic', label: 'Chromatic', title: 'Radius → semitones, ignoring key' },
+];
+
 export function OrbitalPanel() {
   const project = useStore((s) => s.project);
+  const ui = useStore((s) => s.ui);
   const st = useStore.getState();
   const o = project.orbital;
-  const set = (patch: Partial<typeof o>) => { st.commit((p) => ({ ...p, orbital: { ...p.orbital, ...patch } })); st.regenerateOrbital(); };
+  const v = o.voices.find((x) => x.id === o.active) ?? o.voices[0];
+  const setO = (fn: (voices: OrbitalVoice[]) => OrbitalVoice[], active?: string) => { st.commit((p) => ({ ...p, orbital: { voices: fn(p.orbital.voices), active: active ?? p.orbital.active } })); st.regenerateOrbital(); };
+  const setV = (patch: Partial<OrbitalVoice>) => v && setO((vs) => vs.map((x) => (x.id === v.id ? { ...x, ...patch } : x)));
+  const addVoice = () => {
+    const id = uid('orb');
+    const used = new Set(o.voices.map((x) => x.trackId));
+    const track = project.tracks.find((t) => t.id === ui.selectedTrackId && !used.has(t.id)) ?? project.tracks.find((t) => !used.has(t.id) && t.pitch.mode !== 'drums') ?? project.tracks[0];
+    setO((vs) => [...vs, { ...defaultOrbitalVoice(track?.id ?? '', id), bars: v ? v.bars : 4 }], id);
+  };
+  const name = (x: OrbitalVoice) => project.tracks.find((t) => t.id === x.trackId)?.name ?? '?';
   return (
-    <Section title="Orbital sequencer">
-      <Select label="Layer" value={o.trackId} options={project.tracks.map((t) => ({ value: t.id, label: t.name }))} onChange={(v) => set({ trackId: v })} />
-      <Slider label="Bars / turn" value={o.bars} min={1} max={16} step={1} onChange={(v) => st.commit((p) => ({ ...p, orbital: { ...p.orbital, bars: v } }), false)} onCommit={() => st.regenerateOrbital()} onStart={st.checkpoint} fmt={(v) => String(v)} />
-      <Seg label="Direction" value={o.direction} onChange={(v) => set({ direction: v })} options={[{ value: 'cw', label: 'Clockwise' }, { value: 'ccw', label: 'Counter' }]} />
-      <p className="note">Notes repeat once per revolution and are written into the chosen layer, so they play, edit and export like any other notes. Set the project length to a multiple of {o.bars} bars to loop cleanly.</p>
-      <div className="btnrow">
-        <button className="btn small" onClick={() => { st.commit((p) => ({ ...p, orbital: { ...p.orbital, strokes: [] } })); st.regenerateOrbital(); }}>Clear orbit</button>
-        <button className="btn small" onClick={() => st.setSettings({ lengthBars: o.bars, loop: { on: true, start: 0, end: o.bars * barBeats(project.settings.timeSig) } })}>Loop one revolution</button>
+    <Section title="Orbital voices" right={<button className="btn small" onClick={addVoice}>+ Voice</button>}>
+      <div className="voice-tabs" role="tablist" aria-label="Orbital voices">
+        {o.voices.map((x, i) => (
+          <button key={x.id} role="tab" aria-selected={x.id === v?.id} className={`btn small ${x.id === v?.id ? 'on' : ''}`} onClick={() => st.commit((p) => ({ ...p, orbital: { ...p.orbital, active: x.id } }), false)}>
+            <span style={{ width: 8, height: 8, borderRadius: 2, background: project.tracks.find((t) => t.id === x.trackId)?.color ?? '#888' }} />{i + 1} · {name(x)}
+          </button>
+        ))}
       </div>
+      {!v && <p className="note">No voices. Add one to draw in the circle.</p>}
+      {v && (
+        <>
+          <Select label="Layer" value={v.trackId} options={project.tracks.map((t) => ({ value: t.id, label: t.name }))} onChange={(id) => setV({ trackId: id })} />
+          <Slider label="Bars / turn" value={v.bars} min={1} max={16} step={1} onChange={(b) => st.commit((p) => ({ ...p, orbital: { ...p.orbital, voices: p.orbital.voices.map((x) => (x.id === v.id ? { ...x, bars: b } : x)) } }), false)} onCommit={() => st.regenerateOrbital()} onStart={st.checkpoint} fmt={(b) => String(b)} />
+          <Seg label="Direction" value={v.direction} onChange={(d) => setV({ direction: d })} options={[{ value: 'cw', label: 'Clockwise' }, { value: 'ccw', label: 'Counter' }]} />
+          <Seg label="Pitch" value={v.pitch} onChange={(x: OrbitalPitch) => setV({ pitch: x })} options={ORBITAL_PITCH} />
+          {(v.pitch === 'guided' || v.pitch === 'chord') && <Slider label="Adaptation" title="How far a note may move toward the current chord (1–5 semitones)" value={v.adapt} min={0} max={1} def={0.7} onStart={st.checkpoint} onChange={(x) => st.commit((p) => ({ ...p, orbital: { ...p.orbital, voices: p.orbital.voices.map((y) => (y.id === v.id ? { ...y, adapt: x } : y)) } }), false)} onCommit={() => st.regenerateOrbital()} />}
+          <Check label="Repeat through the piece (each turn follows the chords)" checked={v.fill} onChange={(x) => setV({ fill: x })} />
+          <p className="note">Each voice orbits independently: its own layer, length and direction. Notes are written into the layer, so they play, edit and export like any others. Rings are scale degrees (1 = tonic); the chord’s tones glow.</p>
+          <div className="btnrow">
+            <button className="btn small" onClick={() => setV({ strokes: [] })}>Clear voice</button>
+            <button className="btn small danger" disabled={o.voices.length < 2} onClick={() => setO((vs) => vs.filter((x) => x.id !== v.id), o.voices.find((x) => x.id !== v.id)?.id)}>Remove voice</button>
+            <button className="btn small" onClick={() => st.setSettings({ lengthBars: v.bars, loop: { on: true, start: 0, end: v.bars * barBeats(project.settings.timeSig) } })}>Loop one revolution</button>
+          </div>
+        </>
+      )}
     </Section>
   );
 }
@@ -368,8 +419,26 @@ export function ParticlePanel() {
       <Slider label="Length" value={pc.bars} min={1} max={64} step={1} onStart={st.checkpoint} onChange={(v) => set({ bars: v })} fmt={(v) => `${v} bars`} />
       <Select label="Quantize" value={pc.quantize} onChange={(v) => set({ quantize: v })} options={[{ value: 0, label: 'Off' }, ...SUBDIVISIONS.map((d) => ({ value: d.steps, label: d.label }))]} />
       <div className="row"><span className="lbl">Seed</span><span style={{ display: 'flex', gap: 6 }}><Num label="" value={pc.seed} min={1} max={99999} onChange={(v) => set({ seed: v })} width={80} /><button className="btn small" onClick={() => set({ seed: 1 + Math.floor(Math.random() * 9999) })}><IDice size={13} /></button></span></div>
-      <p className="note">{pc.zones.length} zones. Drag on the stage to add a zone for the selected layer. The physics is fixed-step and seeded: the same seed always produces the same notes.</p>
-      <div className="btnrow"><button className="btn small" onClick={() => { engine.seek(0); }}>Restart view</button><button className="btn small danger" onClick={() => set({ zones: [] })}>Clear zones</button></div>
+      <p className="note">Drag on the stage to add a zone for the selected layer. The physics is fixed-step and seeded: the same seed always produces the same motion. Each zone reads an entry through its behaviour and the shared harmony, and avoids clashing with what Orbital and other layers play at that moment.</p>
+      <div className="btnrow"><button className="btn small" onClick={() => { engine.seek(0); }}>Restart view</button><button className="btn small danger" disabled={!pc.zones.length} onClick={() => set({ zones: [] })}>Clear zones</button></div>
+      <h3 className="h">Zones</h3>
+      {!pc.zones.length && <p className="note">No zones yet.</p>}
+      {pc.zones.map((z, i) => {
+        const t = project.tracks.find((x) => x.id === z.trackId);
+        const setZ = (patch: Partial<typeof z>) => set({ zones: pc.zones.map((q) => (q.id === z.id ? { ...q, ...patch } : q)) });
+        const drums = t?.pitch.mode === 'drums';
+        return (
+          <div key={z.id} className="fx">
+            <div className="zone-row">
+              <span style={{ width: 10, height: 10, borderRadius: 2, background: t?.color ?? '#888' }} />
+              <span>{i + 1} · {t?.name ?? 'missing layer'}</span>
+              <button className="btn small danger" aria-label={`Delete zone ${i + 1}`} onClick={() => set({ zones: pc.zones.filter((q) => q.id !== z.id) })}>✕</button>
+            </div>
+            <Select label="Behaviour" value={drums ? 'percussion' : z.behavior ?? 'free'} options={ZONE_BEHAVIORS.filter((b) => (drums ? b.id === 'percussion' : b.id !== 'percussion')).map((b) => ({ value: b.id, label: b.label }))} onChange={(v: ZoneBehavior) => setZ({ behavior: v })} title={ZONE_BEHAVIORS.find((b) => b.id === (z.behavior ?? 'free'))?.title} />
+            {!drums && z.behavior && z.behavior !== 'free' && z.behavior !== 'arp' && <Slider label="Repetition" title="0 = every entry finds a new note; 1 = the zone replays its remembered cell (fitted to the current chord)" value={z.repeat ?? 0.3} min={0} max={1} def={0.3} onStart={st.checkpoint} onChange={(v) => st.commit((p) => ({ ...p, particles: { ...p.particles, zones: p.particles.zones.map((q) => (q.id === z.id ? { ...q, repeat: v } : q)) } }), false)} onCommit={() => st.regenerateParticles()} />}
+          </div>
+        );
+      })}
     </Section>
   );
 }

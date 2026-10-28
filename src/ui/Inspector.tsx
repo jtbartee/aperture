@@ -3,9 +3,11 @@ import { TrackPanel } from './panels/TrackPanel';
 import { FxPanel, SoundPanel } from './panels/SoundPanel';
 import { BrushPanel, GenerativePanel, ImagePanel, OrbitalPanel, PanoramaPanel, ParticlePanel } from './panels/SourcePanels';
 import { ModPanel } from './panels/ModPanel';
+import { HarmonyPanel } from './panels/HarmonyPanel';
 
 const TABS = [
   { id: 'source', label: 'Source' },
+  { id: 'harmony', label: 'Harmony' },
   { id: 'track', label: 'Layer' },
   { id: 'sound', label: 'Sound' },
   { id: 'fx', label: 'FX' },
@@ -25,7 +27,7 @@ export function Inspector() {
         ))}
       </div>
       <div className="insp-body" role="tabpanel">
-        {tab === 'source' ? source : tab === 'track' ? <TrackPanel /> : tab === 'sound' ? <SoundPanel /> : tab === 'fx' ? <FxPanel /> : <ModPanel />}
+        {tab === 'source' ? source : tab === 'harmony' ? <HarmonyPanel /> : tab === 'track' ? <TrackPanel /> : tab === 'sound' ? <SoundPanel /> : tab === 'fx' ? <FxPanel /> : <ModPanel />}
       </div>
     </aside>
   );

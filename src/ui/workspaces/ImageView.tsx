@@ -8,6 +8,7 @@ import { hexA, useStageCanvas } from '../canvas';
 import { drawContours } from '../contourDraw';
 import { Progress } from '../components/controls';
 import { loadProceduralImage } from '../../state/factory';
+import { SourceBar } from '../SourceActions';
 
 export function ImageView() {
   const project = useStore((s) => s.project);
@@ -126,6 +127,7 @@ export function ImageView() {
   }
   return (
     <>
+      <SourceBar kind="image" />
       <canvas ref={ref} onPointerDown={onDown} role="img" aria-label={`Image ${img.asset.name}, ${view === 'photo' ? 'original photograph' : view === 'contours' ? 'extracted contours' : 'photograph with contour overlay'}. Click to seek; Alt-click a note to delete it.`} />
       <div className="hud" style={{ ['--hud-r-w' as string]: '480px' }}>{img.asset.name} · {img.asset.width}×{img.asset.height} · {img.settings.bars} bars · {getAnalysis(img.asset.assetId)?.contours.contours.length ?? 0} contours · click = seek · alt-click note = delete</div>
       <div className="hud hud-r" style={{ pointerEvents: 'auto', display: 'flex', gap: 8, alignItems: 'center' }}>

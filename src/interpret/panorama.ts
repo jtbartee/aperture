@@ -2,14 +2,14 @@
 // position corresponds to a moment of the piece; the scrolling viewport, the analysed strip and
 // the generated events all use it, which is what keeps sight and sound aligned.
 
-import type { PanoramaSettings, PanoramaSource, ProjectSettings, Region, Role } from '../core/types';
+import type { ChordSlot, PanoramaSettings, PanoramaSource, ProjectSettings, Region, Role } from '../core/types';
 import { hash32, rng } from '../core/rng';
 import { barBeats } from '../core/time';
 import { type FeatureGrid, bandMask, bitsMask, fullMask, regionCurve, type MaskFn } from '../analysis/features';
 import { type ContourSet, contourPreset } from '../analysis/contours';
 import { instrument } from '../audio/patches';
 import { curveLane, generateRole } from './roles';
-import { imageHarmony } from './imageModes';
+import { imageHarmony, type MusicInput } from './imageModes';
 import { fxSlot, layer, type LayerOutput, PALETTE } from './layers';
 import { defaultShape, scanSegments } from './sonify';
 import { atmosphereLayer, contourVoiceLayers, contourVoiceSpecs, rhythmLayer, type SonicContext } from './sonicLayers';
@@ -125,15 +125,24 @@ export function scanPath(s: PanoramaSettings, steps: number): { x: number; y?: n
  *  the atmosphere bed is re-voiced only at big changes while its Image Synth lanes evolve along the
  *  scan; the rhythm layer follows the rhythm mode; classic region roles remain available. Every
  *  layer uses the same scan mapping (scanPoint) as the scrolling view. `only` regenerates one layer. */
-export function generatePanoramaLayers(a: { grid: FeatureGrid; contours: ContourSet }, src: PanoramaSource, ps: ProjectSettings, only?: string): LayerOutput[] {
+/** The panorama's own harmony: colour-guided along the scan (or the shared, locked timeline). */
+export function panoramaTimeline(a: { grid: FeatureGrid; contours: ContourSet }, src: PanoramaSource, ps: ProjectSettings, mi?: MusicInput): ChordSlot[] {
+  if (mi?.slots?.length) return mi.slots;
+  const s = src.settings;
+  const beats = panoramaBeats(s, ps);
+  const n = Math.max(16, Math.round(s.scanResolution));
+  const frame = regionCurve(a.grid, fullMask, { steps: n, sensitivity: s.sensitivity, strip: Math.max(1, s.stripWidth * 3), smoothing: Math.max(0.5, s.smoothing), path: scanPath(s, n) });
+  return imageHarmony(frame, ps, beats, rng(hash32(mi?.seed && mi.seed !== 1 ? `${s.seed}:pano:harmony:${mi.seed}` : `${s.seed}:pano:harmony`)), undefined, mi);
+}
+
+export function generatePanoramaLayers(a: { grid: FeatureGrid; contours: ContourSet }, src: PanoramaSource, ps: ProjectSettings, only?: string, mi?: MusicInput): LayerOutput[] {
   const grid = a.grid;
   const s = src.settings;
   const beats = panoramaBeats(s, ps);
   const n = Math.max(16, Math.round(s.scanResolution));
   const path = scanPath(s, n);
   const curveOpts = { steps: n, sensitivity: s.sensitivity, strip: s.stripWidth, smoothing: s.smoothing, path };
-  const frame = regionCurve(grid, fullMask, { ...curveOpts, strip: Math.max(1, s.stripWidth * 3), smoothing: Math.max(0.5, s.smoothing) });
-  const harmony = imageHarmony(frame, ps, beats, rng(hash32(`${s.seed}:pano:harmony`)));
+  const harmony = panoramaTimeline(a, src, ps, mi);
   const out: LayerOutput[] = [];
   const want = (k: string) => !only || only === k;
   const dense = scanPath(s, 1024);

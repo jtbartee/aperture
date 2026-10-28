@@ -1,20 +1,28 @@
-// GENERATIVE COMPOSER. A piece is planned before it is written:
-//   structure → sections (intensity, which layers play) → shared harmony →
-//   per-layer phrases, each with its own rhythmic identity (pattern length, subdivision,
-//   phase), remembered and mutated so long pieces develop instead of looping.
+// GENERATIVE COMPOSER. A piece is planned before a single note is written:
+//   A. key, scale and harmonic behaviour come from the project (the shared musical context);
+//   B. a progression or modal centre is chosen (style default, the harmony panel, or locked);
+//   C. a principal motif — the theme — is invented (and a second one for contrasting sections);
+//   D. each layer gets a musical role; E. each role its own rhythmic identity (pattern length,
+//      subdivision, phase) so layers form polyrhythms rather than one grid;
+//   F. complementary material is written against the harmony (bass on roots/pedals, pads voice-led,
+//      arpeggios on real chord tones, the melody developing the theme);
+//   G–I. phrases develop (sequence, fragmentation, inversion, augmentation, gradual substitution),
+//      sections change intensity and texture, and cadences resolve, suspend or stay open by style.
 // Every decision draws from seeded RNG streams forked per (layer, section, phrase), so the same
 // inputs + seed reproduce identical events, and changing one setting does not reshuffle everything.
+// A final harmonic fit enforces the behaviour (Strict: in-scale, chord tones on strong beats).
 
-import type { AutomationLane, CompositionSettings, EffectSlot, Mix, NoteEvent, ProjectSettings, Role, RhythmSpec, StructureId, StyleId, Stroke } from '../core/types';
+import type { AutomationLane, ChordColour, CompositionSettings, EffectSlot, HarmonySettings, Mix, NoteEvent, ProjectSettings, Role, RhythmSpec, StructureId, StyleId, Stroke } from '../core/types';
 import { hash32, rng, type Rng } from '../core/rng';
-import { TIME_SIGS, barBeats, metricWeight } from '../core/time';
+import { TIME_SIGS, barBeats, beatStrength, metricWeight } from '../core/time';
 import type { Curve } from '../analysis/features';
 import { curveValue } from '../analysis/features';
 import { type ChordSlot, type ProgressionType, chordAt, generateProgression } from '../theory/progression';
 import { chordFromQuality, voiceLead } from '../theory/chords';
-import { generateMelody, type MelodyBehavior } from '../theory/melody';
 import { defaultRhythm, euclid, expandRhythm } from '../theory/rhythm';
 import { degreeToMidi, midiToDegree, inScale, scaleIntervals } from '../theory/scales';
+import { type MusicalContext, musicalContext, slotAt } from '../theory/context';
+import { type Grammar, type Motif, chordAnchor, makeMotif, planPhrase, realiseUnit, substitute, displace, invert } from '../theory/motif';
 import { instrument } from '../audio/patches';
 import { fxSlot, layer, type LayerOutput, ROLE_RANGE } from './layers';
 
@@ -27,65 +35,71 @@ interface StyleProfile {
   swing: number;
   progression: ProgressionType;
   harmonicRhythm: number;
+  colour: ChordColour;
   phraseBars: number;
   /** layer → minimum section intensity at which it plays */
   layers: Partial<Record<LayerId, number>>;
   patches: Partial<Record<LayerId, string>>;
-  melody: MelodyBehavior[];
+  /** melodic grammar of the theme */
+  grammar: Grammar;
+  /** share of melody statements left silent (negative space) */
+  silence: number;
 }
 
 type LayerId = 'drums' | 'bass' | 'pad' | 'chords' | 'drone' | 'drone2' | 'arp' | 'melody' | 'texture';
 const LAYER_ROLE: Record<LayerId, Role> = { drums: 'percussion', bass: 'bass', pad: 'pad', chords: 'chords', drone: 'drone', drone2: 'drone', arp: 'arp', melody: 'melody', texture: 'texture' };
 const LAYER_NAME: Record<LayerId, string> = { drums: 'Drums', bass: 'Bass', pad: 'Pads', chords: 'Chords', drone: 'Drone', drone2: 'Drone (detuned)', arp: 'Arpeggio', melody: 'Melody', texture: 'Texture' };
 
+const G = (g: Partial<Grammar> & Pick<Grammar, 'form'>): Grammar => ({ count: [3, 5], grids: [0.5], longest: 2, leap: 0.2, rest: 0.2, pickup: 0.2, bars: 1, ...g });
+
 export const STYLES: Record<StyleId, StyleProfile> = {
   ambient: {
-    label: 'Ambient', description: 'Slow evolution, long notes, sparse melody, soft attacks, spacious harmony and sustained drones.',
-    tempo: 72, swing: 0, progression: 'sparse', harmonicRhythm: 4, phraseBars: 8,
+    label: 'Ambient', description: 'Slow harmonic motion, consonant drones, long tones, suspended harmonies, a gently developing motif and intentional negative space.',
+    tempo: 72, swing: 0, progression: 'sparse', harmonicRhythm: 4, colour: 'added', phraseBars: 8,
     layers: { pad: 0, drone: 0, melody: 0.45, texture: 0.3 }, patches: { pad: 'Glassy Ambient Pad', drone: 'Dark Drone', melody: 'Bell / FM Tone', texture: 'Distant Chimes' },
-    melody: ['contour', 'stepwise', 'drone'],
+    grammar: G({ form: 'drone', count: [2, 4], grids: [1, 1.5], longest: 6, leap: 0.15, rest: 0.4, pickup: 0.4, bars: 2 }), silence: 0.35,
   },
   ambientDub: {
-    label: 'Ambient dub', description: 'Minimal repeating motifs, warm bass, filtered chord stabs drenched in echo, sparse one-drop pulse.',
-    tempo: 76, swing: 0.15, progression: 'pedal', harmonicRhythm: 2, phraseBars: 4,
+    label: 'Ambient dub', description: 'Pedal tones, minor/modal harmony, spacious chord fragments, an independent bass line, sparse syncopation and delayed melodic fragments.',
+    tempo: 76, swing: 0.15, progression: 'pedal', harmonicRhythm: 2, colour: 'sevenths', phraseBars: 4,
     layers: { drums: 0.25, bass: 0.2, chords: 0, pad: 0.55, melody: 0.7 }, patches: { bass: 'Deep Current', chords: 'Dusty Keys', pad: 'Faded Tape Pad', melody: 'Hollow Pulse' },
-    melody: ['minimal', 'motif'],
+    grammar: G({ form: 'call', count: [2, 4], grids: [0.5, 0.75], longest: 1.5, leap: 0.25, rest: 0.5, pickup: 0.7 }), silence: 0.3,
   },
   motorik: {
-    label: 'Krautrock / motorik', description: 'Steady forward pulse, locked eighth-note bass, evolving arpeggios, minimal chord movement, gradual timbral change.',
-    tempo: 126, swing: 0, progression: 'modal', harmonicRhythm: 4, phraseBars: 4,
+    label: 'Krautrock / motorik', description: 'Repetition as a device: ostinatos, modal harmony, a sustained pulse, phase interactions, gradual note substitution and evolving timbre.',
+    tempo: 126, swing: 0, progression: 'modal', harmonicRhythm: 4, colour: 'triads', phraseBars: 4,
     layers: { drums: 0, bass: 0.15, arp: 0.35, pad: 0.5, melody: 0.7 }, patches: { bass: 'Analog Mono Bass', arp: 'Soft Machinery', pad: 'Analog Haze', melody: 'Plucked Synth' },
-    melody: ['minimal', 'motif'],
+    grammar: G({ form: 'cell', count: [4, 6], grids: [0.5], longest: 1, leap: 0.1, rest: 0.1, pickup: 0.1 }), silence: 0,
   },
   idm: {
-    label: 'IDM / glitch', description: 'Irregular placement, changing subdivisions, stutters, polymetric layers and unusual intervals.',
-    tempo: 104, swing: 0, progression: 'chromatic', harmonicRhythm: 2, phraseBars: 4,
+    label: 'IDM / glitch', description: 'Complex subdivisions, changing rhythmic cycles, displacement, micro-events and unusual intervals — inside the selected harmony unless Experimental.',
+    tempo: 104, swing: 0, progression: 'sparse', harmonicRhythm: 2, colour: 'sevenths', phraseBars: 4,
     layers: { drums: 0, texture: 0.15, bass: 0.3, melody: 0.4, chords: 0.6 }, patches: { bass: 'Night Bus Bass', melody: 'Digital Mallet', chords: 'Metallic Bloom', texture: 'Glitch Percussion' },
-    melody: ['leaping', 'chromatic', 'motif'],
+    grammar: G({ form: 'sentence', count: [4, 7], grids: [0.25, 0.2, 1 / 6], longest: 0.75, leap: 0.45, rest: 0.25, pickup: 0.6 }), silence: 0.1,
   },
   minimal: {
-    label: 'Minimal electronic', description: 'Short pulses, small clusters, precise placement, repetition with slow pattern mutation.',
-    tempo: 122, swing: 0.05, progression: 'pedal', harmonicRhythm: 8, phraseBars: 4,
+    label: 'Minimal electronic', description: 'Small melodic cells, repetitive figures, additive and subtractive rhythm, gradual phase variation and very slow harmonic development.',
+    tempo: 122, swing: 0.05, progression: 'pedal', harmonicRhythm: 8, colour: 'added', phraseBars: 4,
     layers: { drums: 0, chords: 0.2, bass: 0.35, arp: 0.55, texture: 0.7 }, patches: { chords: 'Hollow Pulse', bass: 'Sub Bass', arp: 'Soft Arpeggio Synth', texture: 'Microclicks' },
-    melody: ['minimal'],
+    grammar: G({ form: 'cell', count: [3, 4], grids: [0.25, 0.5], longest: 0.5, leap: 0.15, rest: 0.2, pickup: 0.3 }), silence: 0,
   },
   drone: {
-    label: 'Drone / experimental', description: 'Sustained structures, very slow movement, beating oscillators, micro-events and long-form transformation.',
-    tempo: 60, swing: 0, progression: 'static', harmonicRhythm: 16, phraseBars: 8,
+    label: 'Drone / experimental', description: 'Tonal centres held on fifths and octaves, selected extensions, restrained beating, minimal note changes and long-form spectral development.',
+    tempo: 60, swing: 0, progression: 'static', harmonicRhythm: 16, colour: 'sus', phraseBars: 8,
     layers: { drone: 0, drone2: 0, pad: 0.4, texture: 0.25 }, patches: { drone: 'Subterranean Drone', drone2: 'Dark Drone', pad: 'Frozen Glass', texture: 'Microclicks' },
-    melody: ['drone'],
+    grammar: G({ form: 'drone', count: [1, 2], grids: [2], longest: 8, leap: 0, rest: 0.5, pickup: 0.5, bars: 2 }), silence: 0.5,
   },
   cinematic: {
-    label: 'Cinematic', description: 'Contrasting sections, tension and release, atmospheric transitions and controlled build-ups.',
-    tempo: 92, swing: 0, progression: 'tension', harmonicRhythm: 2, phraseBars: 4,
+    label: 'Cinematic', description: 'A theme that is stated, developed and recalled; expanded harmony, register changes, contrast, dynamics and tension → release.',
+    tempo: 92, swing: 0, progression: 'tension', harmonicRhythm: 2, colour: 'auto', phraseBars: 4,
     layers: { pad: 0, drone: 0, bass: 0.35, arp: 0.5, melody: 0.55, drums: 0.75 }, patches: { pad: 'Warm Analog Pad', drone: 'Dark Drone', bass: 'Sub Bass', arp: 'Plucked Synth', melody: 'Electric Keyboard' },
-    melody: ['motif', 'callResponse'],
+    grammar: G({ form: 'theme', count: [4, 6], grids: [0.5, 1], longest: 3, leap: 0.3, rest: 0.15, pickup: 0.35 }), silence: 0.05,
   },
   atonal: {
-    label: 'Abstract / atonal', description: 'Chromatic clusters, irregular intervals and non-traditional harmony — controlled, not random.',
-    tempo: 84, swing: 0, progression: 'chromatic', harmonicRhythm: 2, phraseBars: 4,
+    label: 'Abstract / atonal', description: 'Deliberate pitch-class sets and their transformations, recurring intervals, fixed registers, clusters and structured rhythmic irregularity.',
+    tempo: 84, swing: 0, progression: 'chromatic', harmonicRhythm: 2, colour: 'auto', phraseBars: 4,
     layers: { chords: 0, melody: 0.2, texture: 0.35, drums: 0.6 }, patches: { chords: 'Metallic Bloom', melody: 'Bell / FM Tone', texture: 'Glitch Percussion' },
-    melody: ['leaping', 'chromatic'],
+    grammar: G({ form: 'sentence', count: [4, 6], grids: [0.25, 0.75, 1 / 3], longest: 2, leap: 0.6, rest: 0.3, pickup: 0.5 }), silence: 0.15,
   },
 };
 
@@ -103,8 +117,18 @@ export function defaultComposition(): CompositionSettings {
   return {
     style: 'ambient', structure: 'arc', source: 'none', bars: 32, seed: 1, complexity: 0.5, variation: 0.5, density: 0.5,
     repetition: 0.6, probability: 0.85, tension: 0.4, irregularity: 0.3, range: 0.5, register: 0.5, mutation: 0.35, evolution: 0.5,
-    locks: { melody: false, harmony: false, rhythm: false, instruments: false, selected: true }, bypassScale: true,
+    locks: { melody: false, harmony: false, rhythm: false, instruments: false, selected: true }, bypassScale: true, percussion: true, time: 'metric',
   };
+}
+
+/** The progression a style uses when the harmony panel is on Auto. Chromatic movement is only
+ *  ever chosen automatically under Experimental (or for atonal pieces that bypass the scale). */
+export function styleProgression(style: StyleId, h: Pick<HarmonySettings, 'behavior'>, c: Pick<CompositionSettings, 'tension' | 'bypassScale'>): ProgressionType {
+  const p = STYLES[style].progression;
+  if (style === 'idm' && h.behavior === 'experimental') return 'chromatic';
+  if (style === 'atonal') return c.bypassScale || h.behavior === 'experimental' ? 'chromatic' : 'sparse';
+  if (p === 'sparse' && c.tension > 0.7) return 'tension';
+  return p;
 }
 
 export function planSections(c: CompositionSettings, bb: number, r: Rng): Section[] {
@@ -169,10 +193,17 @@ interface Ctx {
   sections: Section[];
   guide?: Curve;
   atonal: boolean;
-  row: number[];
+  /** the pitch-class set form sequence for atonal pieces */
+  sets: number[][];
+  /** fixed register (MIDI octave base) per pitch class for atonal pieces */
+  registers: number[];
+  mc: MusicalContext;
+  theme: Motif;
+  theme2: Motif;
 }
 
 const c01 = (x: number) => Math.max(0, Math.min(1, x));
+const mod12 = (x: number) => ((x % 12) + 12) % 12;
 
 function intensityAt(ctx: Ctx, sec: Section, beat: number): number {
   let i = sec.intensity;
@@ -194,15 +225,18 @@ function shiftPattern(p: Pattern, dBeat: number, dDegree: number, ctx: Ctx, base
   });
 }
 
-/** Controlled mutation of a remembered phrase: nudge pitches, drop or add notes, displace timing. */
-function mutate(p: Pattern, amount: number, r: Rng, ctx: Ctx, base: number, step: number): Pattern {
+/** Controlled mutation of a remembered phrase: nudge pitches, drop or add notes, displace timing.
+ *  Pitch nudges are scale steps; the harmonic fit afterwards puts strong positions back on chord tones. */
+function mutate(p: Pattern, amount: number, r: Rng, ctx: Ctx, base: number, step: number, role: Role): Pattern {
   if (amount <= 0) return p;
   const out: Pattern = [];
+  // harmony parts keep their pitches (they carry the chord); a bass may vary only off the beat
+  const pitchFree = (n: NoteEvent) => role === 'melody' || role === 'texture' || (role === 'bass' && beatStrength(ctx.ps.timeSig, ((n.start % ctx.bb) + ctx.bb) % ctx.bb) < 0.75);
   for (const n of p) {
     const x = r();
     if (x < amount * 0.18) continue; // drop
     let m = { ...n };
-    if (r() < amount * 0.45 && m.degree !== undefined) {
+    if (r() < amount * 0.45 && m.degree !== undefined && pitchFree(m)) {
       m.degree = m.degree + r.pick([-2, -1, 1, 2]);
       m.midi = degreeToMidi(m.degree, ctx.ps.key, ctx.ps.scale, base, ctx.ps.customScale);
     }
@@ -211,7 +245,7 @@ function mutate(p: Pattern, amount: number, r: Rng, ctx: Ctx, base: number, step
     if (r() < amount * 0.12) {
       // add a passing note
       const extra = { ...m, start: m.start + step, dur: Math.min(m.dur, step), id: `${m.id}x` };
-      if (extra.degree !== undefined) { extra.degree += r.pick([-1, 1]); extra.midi = degreeToMidi(extra.degree, ctx.ps.key, ctx.ps.scale, base, ctx.ps.customScale); }
+      if (extra.degree !== undefined && pitchFree(extra)) { extra.degree += r.pick([-1, 1]); extra.midi = degreeToMidi(extra.degree, ctx.ps.key, ctx.ps.scale, base, ctx.ps.customScale); }
       out.push(extra);
     }
   }
@@ -220,23 +254,51 @@ function mutate(p: Pattern, amount: number, r: Rng, ctx: Ctx, base: number, step
 
 const rootDegree = (slot: ChordSlot) => (slot.chord.degree >= 0 ? slot.chord.degree : 0);
 
+/** The bass pitch class of a moment and, if the chord has one, its fifth (pitch-class arithmetic,
+ *  so a pentatonic or blues scale never gets a "fifth" that is really its fourth step). */
+function bassTones(slot: ChordSlot): { root: number; fifth: number | null; third: number | null; seventh: number | null } {
+  const has = (iv: number) => slot.chord.pcs.includes(mod12(slot.chord.rootPc + iv));
+  return {
+    root: slot.bassPc,
+    fifth: has(7) ? mod12(slot.chord.rootPc + 7) : null,
+    third: has(4) ? mod12(slot.chord.rootPc + 4) : has(3) ? mod12(slot.chord.rootPc + 3) : null,
+    seventh: has(10) ? mod12(slot.chord.rootPc + 10) : has(11) ? mod12(slot.chord.rootPc + 11) : null,
+  };
+}
+
+/** A pitch of pitch class pc in [lo, hi], nearest to `near`. */
+function place(pc: number, near: number, lo: number, hi: number): number {
+  let best = lo + mod12(pc - lo);
+  for (let m = best; m <= hi; m += 12) if (Math.abs(m - near) < Math.abs(best - near)) best = m;
+  return best;
+}
+
 /** Phrase generators per layer. Each returns notes for [start, start + bars·bb). */
-function genPhrase(id: LayerId, ctx: Ctx, sec: Section, start: number, bars: number, r: Rng, base: number, range: { low: number; high: number }, spec: RhythmSpec): Pattern {
+function genPhrase(id: LayerId, ctx: Ctx, sec: Section, start: number, bars: number, r: Rng, base: number, range: { low: number; high: number }, spec: RhythmSpec, ph: { k: number; pi: number }): Pattern {
+  const phraseIdx = ph.pi;
   const { c, ps, bb } = ctx;
   const len = bars * bb;
   const end = start + len;
   const notes: Pattern = [];
-  const deg = (d: number) => degreeToMidi(d, ps.key, ps.scale, base, ps.customScale);
-  const n = scaleIntervals(ps.scale, ps.customScale).length;
+  const degOf = (m: number) => (inScale(m, ps.key, ps.scale, ps.customScale) ? midiToDegree(m, ps.key, ps.scale, base, ps.customScale) : undefined);
+  // probability thins events, never single tones of a chord: sustained harmony is exempt and a
+  // chord stab is kept or dropped whole
+  const sustained = id === 'pad' || id === 'drone' || id === 'drone2';
+  const stab = new Map<number, boolean>();
   const add = (beat: number, dur: number, midi: number, vel: number, degree?: number) => {
     if (beat < start - 1e-9 || beat >= end - 1e-9) return;
-    if (c.probability < 1 && vel < 0.9 && !r.chance(0.5 + c.probability * 0.5)) return;
+    if (c.probability < 1 && vel < 0.9 && !sustained) {
+      const k = Math.round(beat * 8);
+      const keep = id === 'chords' ? stab.get(k) ?? (stab.set(k, r.chance(0.5 + c.probability * 0.5)), stab.get(k)!) : r.chance(0.5 + c.probability * 0.5);
+      if (!keep) return;
+    }
     notes.push({ id: '', start: beat, dur: Math.max(0.04, Math.min(dur, ctx.beats - beat)), midi, vel: c01(vel), origin: 'generated', degree });
   };
   const inten = intensityAt(ctx, sec, start);
   const style = c.style;
   const ts = ps.timeSig;
   const info = TIME_SIGS[ts];
+  const stage = start / Math.max(1, ctx.beats);
 
   switch (id) {
     case 'drums': {
@@ -250,7 +312,7 @@ function genPhrase(id: LayerId, ctx: Ctx, sec: Section, start: number, bars: num
           if (inten > 0.6) add(b0 + lastGroup + info.pulse * 0.5, 0.2, 36, 0.6);
           for (let k = 1; k < groups.length; k += 2) add(b0 + groups[k], 0.2, 38, 0.8);
           if (groups.length === 1 || ts === '3/4') add(b0 + info.pulse * 2, 0.2, 38, 0.75);
-          for (let b = 0; b < bb - 1e-9; b += 0.5) add(b0 + b, 0.1, b % 1 ? 42 : 42, b % 1 ? 0.45 : 0.6);
+          for (let b = 0; b < bb - 1e-9; b += 0.5) add(b0 + b, 0.1, 42, b % 1 ? 0.45 : 0.6);
           if (inten > 0.75 && bar % 2 === 1) add(b0 + bb - 0.5, 0.4, 46, 0.5);
         } else if (style === 'ambientDub') {
           // one-drop: kick + rim together in the middle of the bar, echoing hats
@@ -286,49 +348,73 @@ function genPhrase(id: LayerId, ctx: Ctx, sec: Section, start: number, bars: num
           for (const g of groups) { add(b0 + g, 0.4, 36, 0.9); add(b0 + g, 0.6, 56, 0.4); }
           if (bar === bars - 1) for (let k = 0; k < 8; k++) add(b0 + bb - 1 + k / 8, 0.08, 38, 0.3 + k * 0.08);
         } else {
-          // atonal: irregular partitions of the bar
-          let b = 0;
+          // atonal: a durational series (1, 2, 3, 5 sixteenths) permuted per bar — irregular but ordered
+          const series = [1, 2, 3, 5].map((x) => x * 0.25 * (0.8 + c.irregularity * 0.4));
+          const order = series.map((_, k) => series[(k + bar) % 4]);
+          let b = 0, k = 0;
           while (b < bb - 1e-9) {
-            const d = r.pick([0.25, 0.5, 0.75, 1.25]) * (0.8 + c.irregularity);
-            if (r.chance(0.5 + inten * 0.3)) add(b0 + b, 0.1, r.pick([56, 37, 39]), 0.4 + r() * 0.4);
-            b += d;
+            if (r.chance(0.5 + inten * 0.3)) add(b0 + b, 0.1, [56, 37, 39][k % 3], 0.4 + r() * 0.4);
+            b += order[k % 4]; k++;
           }
         }
       }
       break;
     }
     case 'bass': {
-      for (let b = start; b < end - 1e-9; ) {
-        const slot = chordAt(ctx.harmony, b);
-        const rd = rootDegree(slot);
-        if (style === 'motorik') {
-          const d = r.chance(0.12 * (1 + c.complexity)) && b % 1 ? rd + n : rd;
-          add(b, 0.42, deg(d), b % 1 ? 0.6 : 0.85, d);
-          b += 0.5;
-        } else if (style === 'ambient' || style === 'drone') {
-          add(b, slot.start + slot.dur - b, deg(rd), 0.55, rd);
-          b = slot.start + slot.dur;
-        } else if (style === 'cinematic') {
-          if (inten > 0.6) { add(b, 0.45, deg(rd), b % 1 ? 0.55 : 0.8, rd); b += 0.5; }
-          else { add(b, Math.min(bb * 2, slot.start + slot.dur - b), deg(rd), 0.65, rd); b += Math.min(bb * 2, slot.start + slot.dur - b); }
-        } else break;
-      }
-      if (style === 'ambientDub' || style === 'idm' || style === 'minimal') {
-        // rhythm-spec driven: independent pattern length → the bass phases against the bar
-        const onsets = expandRhythm(spec, len, ts, r.fork('bass'), 0);
-        let prevDeg = 0;
-        for (const o of onsets) {
-          const b = start + o.beat;
-          const rd = rootDegree(chordAt(ctx.harmony, b));
-          let d = rd;
-          if (style === 'idm') d = rd + r.weighted([0, n, 4, -3, n + 4], [3, 2, 2, 1, c.irregularity * 2]);
-          else if (style === 'ambientDub') d = o.accent >= 0.75 ? rd : rd + r.weighted([0, 4, 2, n], [3, 2, 1, 1]);
-          if (style === 'minimal' && o.accent >= 0.75 && r.chance(0.6)) continue; // offbeat-led
-          const dur = style === 'ambientDub' ? Math.min(1.5, o.dur * 1.6) : o.dur * (style === 'minimal' ? 0.4 : 0.7);
-          add(b, dur, deg(d), 0.6 + o.accent * 0.35, d);
-          prevDeg = d;
+      if (style === 'motorik') {
+        // eighth-note ostinato: root, octave, the chord's fifth — one position changes per phrase
+        const cell = [0, 0, 12, 0, 0, 7, 12, 0];
+        const r2 = rng(hash32(`bassCell:${c.seed}`));
+        for (let k = 0; k < phraseIdx; k++) if (r2.chance(0.3 + c.complexity * 0.4)) cell[r2.int(1, 7)] = r2.pick([0, 7, 12, 10]);
+        for (let b = start, i = 0; b < end - 1e-9; b += 0.5, i++) {
+          const t = bassTones(chordAt(ctx.harmony, b));
+          const iv = cell[i % cell.length];
+          const pc = iv === 7 ? t.fifth ?? t.root : iv === 10 ? t.seventh ?? t.root : t.root;
+          const m = place(pc, range.low + 7, range.low, range.high) + (iv === 12 ? 12 : 0);
+          add(b, 0.42, Math.min(range.high + 12, m), b % 1 ? 0.6 : 0.85, degOf(m));
         }
-        void prevDeg;
+      } else if (style === 'ambient' || style === 'drone') {
+        for (let b = start; b < end - 1e-9;) {
+          const slot = chordAt(ctx.harmony, b);
+          const m = place(slot.bassPc, range.low + 5, range.low, range.high);
+          add(b, slot.start + slot.dur - b, m, 0.55, degOf(m));
+          b = slot.start + slot.dur;
+        }
+      } else if (style === 'cinematic') {
+        for (let b = start; b < end - 1e-9;) {
+          const slot = chordAt(ctx.harmony, b);
+          const m = place(slot.bassPc, range.low + 5, range.low, range.high);
+          if (inten > 0.6) { add(b, 0.45, m, b % 1 ? 0.55 : 0.8, degOf(m)); b += 0.5; }
+          else { const d = Math.min(bb * 2, slot.start + slot.dur - b); add(b, d, m, 0.65, degOf(m)); b += d; }
+        }
+      } else {
+        // rhythm-spec driven: independent pattern length → the bass phases against the bar. A riff
+        // of chord-tone choices is fixed per piece (identity) and follows each chord's root.
+        const onsets = expandRhythm(spec, len, ts, r.fork('bass'), 0);
+        const rr = rng(hash32(`bassRiff:${c.seed}:${style}`));
+        const riff = Array.from({ length: 8 }, (_, k) => (k === 0 ? 'root' : rr.weighted(['root', 'fifth', 'octave', 'seventh', 'third'] as const, style === 'ambientDub' ? [3, 3, 2, 1.5, 0.5] : style === 'idm' ? [2, 2, 2, 1, 1 + c.irregularity] : [4, 2, 1, 0.2, 0.2])));
+        let prev = place(chordAt(ctx.harmony, start).bassPc, range.low + 5, range.low, range.high);
+        onsets.forEach((o, k) => {
+          const b = start + o.beat;
+          const slot = chordAt(ctx.harmony, b);
+          const t = bassTones(slot);
+          if (style === 'minimal' && o.accent >= 0.75 && r.chance(0.6)) return; // offbeat-led
+          const choice = o.accent >= 0.75 ? 'root' : riff[k % riff.length];
+          let pc = choice === 'fifth' ? t.fifth ?? t.root : choice === 'seventh' ? t.seventh ?? t.root : choice === 'third' ? t.third ?? t.root : t.root;
+          let m = place(pc, prev, range.low, range.high);
+          if (choice === 'octave') m = Math.min(range.high + 12, place(t.root, range.low + 5, range.low, range.high) + 12);
+          // approach tone into a chord change (a scale step; chromatic only when Experimental)
+          const nextB = start + (onsets[k + 1]?.beat ?? len);
+          const nextSlot = chordAt(ctx.harmony, nextB);
+          if (nextSlot !== slot && o.accent < 0.5 && r.chance(0.35)) {
+            const target = place(nextSlot.bassPc, m, range.low, range.high);
+            const step = ctx.mc.behavior === 'experimental' ? 1 : (() => { for (let s = 1; s <= 2; s++) if (inScale(target - s, ps.key, ps.scale, ps.customScale)) return s; return 0; })();
+            if (step) { m = target - step; pc = mod12(m); }
+          }
+          const dur = style === 'ambientDub' ? Math.min(1.5, o.dur * 1.6) : o.dur * (style === 'minimal' ? 0.4 : 0.7);
+          add(b, dur, m, 0.6 + o.accent * 0.35, degOf(m));
+          prev = m;
+        });
       }
       break;
     }
@@ -340,83 +426,101 @@ function genPhrase(id: LayerId, ctx: Ctx, sec: Section, start: number, bars: num
         if (slot.start + slot.dur <= start || slot.start >= end) continue;
         const a = Math.max(start, slot.start);
         const z = Math.min(end, slot.start + slot.dur);
-        const chord = atonal ? chordFromQuality(ctx.row[Math.floor(a / bb) % 12], r.pick(['cluster', 'quartal', 'maj7s11'] as const), -1) : slot.chord;
+        // atonal: the current set form, verticalised in each pitch class's fixed register
+        if (atonal) {
+          const set = ctx.sets[Math.floor(a / bb) % ctx.sets.length];
+          const v = set.map((pc) => ctx.registers[pc] + pc).filter((m) => m >= range.low - 12 && m <= range.high + 12);
+          let b = a;
+          const durs = [1.5, 0.75, 2.25, 1];
+          let k = 0;
+          while (b < z - 1e-9) {
+            if (r.chance(0.5 + inten * 0.3)) v.forEach((m, j) => add(b + j * 0.02, Math.min(durs[k % 4], z - b), m, 0.45 + r() * 0.25));
+            b += durs[k % 4]; k++;
+          }
+          continue;
+        }
         const size = Math.max(2, Math.min(6, 3 + Math.round(c.complexity * 2 + (style === 'drone' ? 1 : 0))));
-        const v = voiceLead(prev, chord, range.low, range.high, size);
+        const v = voiceLead(prev, slot.chord, range.low, range.high, size);
         prev = v;
-        const dIdx = (m: number) => (!atonal && inScale(m, ps.key, ps.scale, ps.customScale) ? midiToDegree(m, ps.key, ps.scale, base, ps.customScale) : undefined);
         if (id === 'pad') {
           const vel = 0.3 + inten * 0.35;
-          v.forEach((m, j) => add(a + j * 0.015, z - a, m, vel * (j ? 0.85 : 1), dIdx(m)));
+          v.forEach((m, j) => add(a + j * 0.015, z - a, m, vel * (j ? 0.85 : 1), degOf(m)));
         } else if (style === 'ambientDub') {
-          // off-beat skank stabs
+          // spacious chord fragments: the upper tones only, off-beat skank stabs
+          const frag = v.slice(-Math.max(2, Math.min(3, v.length - 1)));
           for (let b = a; b < z - 1e-9; b += 1) {
             const pos = ((b % bb) + bb) % bb;
-            if (Math.floor(pos) % 2 === 1 || ts === '6/8' || ts === '9/8') v.forEach((m) => add(b + 0.5 * (ts === '6/8' || ts === '9/8' ? 1 : 0), 0.22, m, 0.55, dIdx(m)));
+            if (Math.floor(pos) % 2 === 1 || ts === '6/8' || ts === '9/8') frag.forEach((m) => add(b + 0.5 * (ts === '6/8' || ts === '9/8' ? 1 : 0), 0.22, m, 0.55, degOf(m)));
           }
         } else if (style === 'minimal') {
-          const hits = expandRhythm({ ...spec, length: spec.length + 3, pulses: Math.max(2, spec.pulses - 1) }, z - a, ts, r.fork(`cl${a}`), 0);
-          for (const h of hits) v.slice(0, 3).forEach((m) => add(a + h.beat, 0.12, m, 0.4 + h.accent * 0.3, dIdx(m)));
-        } else if (style === 'idm' || atonal) {
-          let b = a;
-          while (b < z - 1e-9) {
-            if (r.chance(0.45 + inten * 0.3)) v.forEach((m, j) => add(b + j * r.pick([0, 0.02, 0.05]), r.pick([0.25, 0.5, 1.5]), m, 0.45 + r() * 0.3, dIdx(m)));
-            b += r.pick([0.75, 1, 1.25, 1.5, 2]);
+          // additive / subtractive: the pulse count grows and shrinks phrase by phrase
+          const pulses = Math.max(2, Math.min(spec.length + 2, spec.pulses - 1 + Math.round(2 * Math.sin(phraseIdx * 0.8))));
+          const hits = expandRhythm({ ...spec, length: spec.length + 3, pulses }, z - a, ts, r.fork(`cl${a}`), 0);
+          for (const h of hits) v.slice(0, 3).forEach((m) => add(a + h.beat, 0.12, m, 0.4 + h.accent * 0.3, degOf(m)));
+        } else if (style === 'idm') {
+          // a rhythmic cycle of 5 or 7 sixteenths, displaced each bar: changing cycles, same harmony
+          const cyc = euclid(3, c.irregularity > 0.5 ? 7 : 5, 0);
+          for (let b = a, s = Math.floor(a * 4) % cyc.length; b < z - 1e-9; b += 0.25, s++) {
+            if (!cyc[(s + Math.floor(b / bb)) % cyc.length]) continue;
+            if (!r.chance(0.55 + inten * 0.35)) continue;
+            const voices = v.slice(r.int(0, 1));
+            voices.forEach((m, j) => add(b + j * r.pick([0, 0.02]), r.pick([0.2, 0.45, 0.9]), m, 0.45 + r() * 0.3, degOf(m)));
           }
         } else {
-          for (let b = a; b < z - 1e-9; b += bb) v.forEach((m) => add(b, Math.min(bb, z - b) * 0.9, m, 0.45 + inten * 0.3, dIdx(m)));
+          for (let b = a; b < z - 1e-9; b += bb) v.forEach((m) => add(b, Math.min(bb, z - b) * 0.9, m, 0.45 + inten * 0.3, degOf(m)));
         }
       }
       break;
     }
     case 'drone':
     case 'drone2': {
+      // tonal centre held on root + fifth (+ octave); the second drone adds a selected extension
+      // (the 9th, or late in the piece the scale's colour tone) — restrained, slow change
       const slot = chordAt(ctx.harmony, start);
-      const rd = rootDegree(slot);
-      const tones = id === 'drone' ? [rd, rd + (n >= 7 ? 4 : 3)] : [rd + n, rd + n + 2];
-      tones.forEach((d, j) => add(start + j * 0.05, len, deg(d), 0.45 + inten * 0.2, d));
+      const root = slot.bassPc;
+      const fifth = inScale(root + 7, ps.key, ps.scale, ps.customScale) || slot.chord.pcs.includes(mod12(root + 7)) ? mod12(root + 7) : null;
+      const lowRoot = place(root, range.low + 4, range.low, range.high);
+      let tones: number[];
+      if (id === 'drone') tones = [lowRoot, fifth !== null ? place(fifth, lowRoot + 7, lowRoot, range.high + 12) : lowRoot + 12];
+      else {
+        const ninth = mod12(root + 2);
+        const colour = ctx.mc.characteristic.find((pc) => ctx.mc.pcs.includes(pc));
+        const ext = stage > 0.5 && colour !== undefined && c.evolution > 0.4 ? colour : ctx.mc.pcs.includes(ninth) ? ninth : root;
+        tones = [lowRoot + 12, place(ext, lowRoot + 14, lowRoot + 12, lowRoot + 26)];
+      }
+      tones.forEach((m, j) => add(start + j * 0.05, len, m, 0.45 + inten * 0.2, degOf(m)));
       break;
     }
     case 'arp': {
       const sub = style === 'motorik' ? 4 : style === 'cinematic' ? 2 : 4;
       const stepLen = 1 / sub;
       const patLen = Math.max(3, Math.min(16, spec.length));
-      const pat = Array.from({ length: patLen }, (_, k) => (style === 'motorik' ? [0, 1, 2, 3, 2, 1, 4, 2][k % 8] : r.int(0, 4)));
+      // the arpeggio's shape comes from the theme's contour (up/down), so it belongs to the piece;
+      // motorik keeps a fixed ostinato and substitutes one step per phrase
+      const signs = ctx.theme.notes.slice(1).map((n, k) => Math.sign(n.step - ctx.theme.notes[k].step) || 1);
+      let pat: number[];
+      if (style === 'motorik') {
+        pat = [0, 1, 2, 3, 2, 1, 4, 2];
+        const rs = rng(hash32(`arpSub:${c.seed}`));
+        for (let k = 0; k < phraseIdx; k++) if (rs.chance(0.25 + c.mutation * 0.5)) pat[rs.int(0, 7)] = rs.int(0, 4);
+      } else {
+        pat = [0];
+        for (let k = 1; k < patLen; k++) pat.push(Math.max(0, Math.min(5, pat[k - 1] + (signs[(k - 1) % Math.max(1, signs.length)] ?? 1))));
+        if (style === 'idm') pat = pat.map((x, k) => (k % 3 === 2 ? x + 1 : x));
+      }
+      const phase = style === 'idm' ? Math.floor(phraseIdx * (1 + c.irregularity * 2)) : 0;
       for (let k = 0, b = start; b < end - 1e-9; k++, b += stepLen) {
         if (spec.probability < 1 && !r.chance(spec.probability)) continue;
         const slot = chordAt(ctx.harmony, b);
         const tones = voiceLead(null, slot.chord, range.low, range.high, 4);
         const ext = [...tones, ...tones.map((m) => m + 12)];
-        const m = ext[pat[k % patLen] % ext.length];
-        const d = inScale(m, ps.key, ps.scale, ps.customScale) ? midiToDegree(m, ps.key, ps.scale, base, ps.customScale) : undefined;
-        add(b, stepLen * 0.75, m, 0.45 + metricWeight(ts, ((b % bb) + bb) % bb) * 0.3, d);
+        const m = ext[pat[(k + phase) % pat.length] % ext.length];
+        add(b, stepLen * 0.75, m, 0.45 + metricWeight(ts, ((b % bb) + bb) % bb) * 0.3, degOf(m));
       }
       break;
     }
     case 'melody': {
-      const behaviors = ctx.style.melody;
-      const behavior = ctx.guide && behaviors.includes('contour') ? 'contour' : behaviors[Math.min(behaviors.length - 1, Math.floor(c.complexity * behaviors.length))];
-      const sub = style === 'ambient' || style === 'drone' ? 1 : style === 'idm' ? 4 : 2;
-      const onsetSpec: RhythmSpec = style === 'idm' || style === 'atonal'
-        ? { ...spec }
-        : { subdiv: sub, length: Math.round(bb * sub), pulses: Math.max(1, Math.round(bb * sub * (0.25 + c.density * 0.5))), rotation: 0, probability: 1, ratchet: 0, humanize: spec.humanize };
-      const onsets = expandRhythm(onsetSpec, len, ts, r.fork('mel'), 0).map((o) => ({ ...o, beat: o.beat + start }));
-      const span = Math.round(5 + c.range * 9);
-      const reg = Math.round((c.register - 0.5) * n);
-      const mid = midiToDegree(Math.round((range.low + range.high) / 2), ps.key, ps.scale, base, ps.customScale) + reg;
-      const mel = generateMelody({
-        onsets, behavior, chords: ctx.harmony, root: ps.key, scale: ps.scale, custom: ps.customScale, base,
-        lo: mid - Math.floor(span / 2), hi: mid + Math.ceil(span / 2), rng: r, restProb: style === 'ambient' ? 0.5 : 0.2 + (1 - c.density) * 0.3,
-        phraseBeats: bb * 2, contour: ctx.guide ? (t) => curveValue(ctx.guide!, 'centroid', t) : undefined, totalBeats: ctx.beats, velocity: 0.55 + inten * 0.3,
-      });
-      for (const m of mel) {
-        const dur = style === 'ambient' ? Math.max(m.dur, 2) : m.dur * (style === 'motorik' ? 0.6 : 0.85);
-        if (ctx.atonal) {
-          const pc = ctx.row[(m.degree ?? 0) % 12 < 0 ? 0 : (m.degree ?? 0) % 12];
-          const midi = range.low + 12 + ((pc - range.low % 12 + 12) % 12) + 12 * r.int(-1, 1);
-          add(m.beat, dur, midi, m.vel);
-        } else add(m.beat, dur, m.midi, m.vel, m.degree);
-      }
+      melodyPhrase(ctx, sec, start, bars, r, base, range, ph, inten, add);
       break;
     }
     case 'texture': {
@@ -425,25 +529,105 @@ function genPhrase(id: LayerId, ctx: Ctx, sec: Section, start: number, bars: num
         for (let b = start; b < end - 1e-9; b += 0.5) {
           if (!r.chance(0.05 + inten * 0.08)) continue;
           const slot = chordAt(ctx.harmony, b);
-          const pc = r.pick(slot.chord.pcs);
-          const midi = 72 + ((pc - 72 % 12 + 12) % 12) + 12 * r.int(0, 1);
-          add(b, 3, midi, 0.25 + r() * 0.25, inScale(midi, ps.key, ps.scale, ps.customScale) ? midiToDegree(midi, ps.key, ps.scale, base, ps.customScale) : undefined);
+          const pc = r.pick(slot.chord.pcs.filter((x) => ctx.mc.pcs.includes(x)).length ? slot.chord.pcs.filter((x) => ctx.mc.pcs.includes(x)) : slot.chord.pcs);
+          const midi = 72 + mod12(pc - 72) + 12 * r.int(0, 1);
+          add(b, 3, midi, 0.25 + r() * 0.25, degOf(midi));
         }
       } else {
+        // micro-events: pitched from the chord (Strict/Expressive) or the set (atonal); Experimental
+        // adds chromatic neighbours of chord tones
         const step = style === 'idm' ? 0.125 : 0.25;
         for (let b = start; b < end - 1e-9; b += step) {
           const gt = g ? curveValue(g, 'texture', b / ctx.beats) : 0.5;
           const p = (style === 'drone' ? 0.03 : 0.08 + c.complexity * 0.12) * (0.5 + gt) * (0.5 + inten);
           if (!r.chance(p)) continue;
           const burst = style === 'idm' && r.chance(0.3) ? r.int(2, 4) : 1;
-          const midi = r.int(range.low, range.high);
-          for (let k = 0; k < burst; k++) add(b + (k * step) / burst, step * 0.4, midi, 0.35 + r() * 0.4);
+          let midi: number;
+          if (ctx.atonal) {
+            const set = ctx.sets[Math.floor(b / bb) % ctx.sets.length];
+            const pc = r.pick(set);
+            midi = ctx.registers[pc] + pc + 12;
+          } else {
+            const slot = chordAt(ctx.harmony, b);
+            const pcs = slot.chord.pcs.filter((x) => ctx.mc.pcs.includes(x));
+            const pc = r.pick(pcs.length ? pcs : ctx.mc.pcs);
+            midi = place(pc, range.low + (range.high - range.low) * r(), range.low, range.high);
+            if (ctx.mc.behavior === 'experimental' && r.chance(0.3)) midi += r.pick([-1, 1]);
+          }
+          for (let k = 0; k < burst; k++) add(b + (k * step) / burst, step * 0.4, midi, 0.35 + r() * 0.4, degOf(midi));
         }
       }
       break;
     }
   }
   return notes;
+}
+
+/** One phrase of the melody: the theme developed unit by unit on the current harmony. */
+function melodyPhrase(ctx: Ctx, sec: Section, start: number, bars: number, r: Rng, base: number, range: { low: number; high: number }, ph: { k: number; pi: number }, inten: number,
+  add: (beat: number, dur: number, midi: number, vel: number, degree?: number) => void) {
+  const { c, ps, bb, style } = ctx;
+  const g = style.grammar;
+  const end = start + bars * bb;
+  const theme = sec.variant === 1 && c.structure !== 'mutation' ? ctx.theme2 : ctx.theme;
+  if (ctx.atonal) { atonalPhrase(ctx, theme, start, end, range, inten, add); return; }
+  const n = scaleIntervals(ps.scale, ps.customScale).length;
+  const span = Math.round(5 + c.range * 9);
+  const reg = Math.round((c.register - 0.5) * n);
+  const centre = midiToDegree(Math.round((range.low + range.high) / 2), ps.key, ps.scale, base, ps.customScale) + reg;
+  // register movement: contrasting sections sit a little higher; the final section returns home
+  const lift = sec.variant === 1 ? Math.round(n / 2) : 0;
+  const lo = centre - Math.floor(span / 2) + lift, hi = centre + Math.ceil(span / 2) + lift;
+  const units = Math.max(1, Math.round(bars / g.bars));
+  const phraseIdx = g.form === 'cell' ? ph.pi : ph.k;
+  const plan = planPhrase(g.form, theme, units, phraseIdx, r.fork('plan'), {
+    stage: start / Math.max(1, ctx.beats), variant: sec.variant, mutation: c.mutation, grid: g.grids[0], expressive: ctx.mc.behavior !== 'strict',
+  });
+  let anchor = chordAnchor(ctx.mc, centre + lift - 1, start, base, lo + 1, hi - 2);
+  plan.forEach((u, k) => {
+    const uStart = start + k * g.bars * bb;
+    if (uStart >= end - 1e-9) return;
+    // intentional silence: some statements are left out (never the cadence), more often at low intensity
+    if (u.cadence === 'none' && k > 0 && r.chance(style.silence * (1.3 - inten))) return;
+    let m = u.motif;
+    // literal repetition vs development; variation adds a substitution; IDM displaces the rhythm
+    if (u.cadence === 'none' && k > 0 && r.chance(c.repetition * 0.35)) m = theme;
+    if (r.chance(c.variation * 0.3)) m = substitute(m, r);
+    if (c.style === 'idm' && phraseIdx % 2 === 1) m = displace(m, g.grids[0] * (1 + Math.round(c.irregularity * 2)));
+    if (sec.variant === 1 && c.style === 'cinematic' && k === 0) m = invert(m);
+    // the anchor is a chord tone chosen so the whole statement fits the range (contour intact)
+    const mn = Math.min(0, ...m.notes.map((x) => x.step)), mx = Math.max(0, ...m.notes.map((x) => x.step));
+    const aLo = lo - mn, aHi = hi - mx;
+    anchor = chordAnchor(ctx.mc, anchor + u.shift, uStart, base, Math.min(aLo, aHi), Math.max(aLo, aHi));
+    const notes = realiseUnit(ctx.mc, { motif: m, start: uStart, anchor, base, lo, hi, cadence: u.cadence, vel: 0.55 + inten * 0.3, chromatic: c.tension * 0.5, rng: r, end });
+    for (const x of notes) {
+      const dur = c.style === 'ambient' || c.style === 'drone' ? Math.max(x.dur, 1.5) : x.dur * (c.style === 'motorik' ? 0.8 : 0.92);
+      add(x.beat, dur, x.midi, x.vel, x.degree);
+    }
+  });
+}
+
+/** Atonal melody: the theme's rhythm and contour, its pitches drawn in order from the current
+ *  pitch-class set form, each pitch class in its fixed register (registral invariance). */
+function atonalPhrase(ctx: Ctx, theme: Motif, start: number, end: number, range: { low: number; high: number }, inten: number,
+  add: (beat: number, dur: number, midi: number, vel: number, degree?: number) => void) {
+  const { bb, style } = ctx;
+  const units = Math.max(1, Math.round((end - start) / (style.grammar.bars * bb)));
+  for (let k = 0; k < units; k++) {
+    const uStart = start + k * style.grammar.bars * bb;
+    const set = ctx.sets[(Math.floor(uStart / bb) + k) % ctx.sets.length];
+    const m = k % 2 ? invert(theme) : theme;
+    for (const nt of m.notes) {
+      const b = uStart + nt.at;
+      if (b >= end - 1e-9) continue;
+      const idx = ((nt.step % set.length) + set.length) % set.length;
+      const pc = set[idx];
+      let midi = ctx.registers[pc] + pc + 12;
+      while (midi > range.high) midi -= 12;
+      while (midi < range.low) midi += 12;
+      add(b, nt.dur, midi, 0.5 + inten * 0.3 + (nt.at === 0 ? 0.1 : 0));
+    }
+  }
 }
 
 function layerRhythm(id: LayerId, c: CompositionSettings, style: StyleId): RhythmSpec {
@@ -481,34 +665,58 @@ export interface ComposeInput {
   only?: string;
   /** user-edited rhythm specs per key — used instead of the style default */
   rhythms?: Map<string, RhythmSpec>;
+  /** the project's harmony settings (behaviour, progression choice, colour, chord sequence) */
+  harmony?: Partial<HarmonySettings>;
 }
 
-export interface ComposeResult { layers: LayerOutput[]; harmony: ChordSlot[]; sections: Section[]; bpm: number }
+export interface ComposeResult { layers: LayerOutput[]; harmony: ChordSlot[]; sections: Section[]; bpm: number; theme: Motif }
+
+/** Pitch-class set forms for atonal pieces: one set class, transposed and inverted in a seeded
+ *  order, so the same intervals keep returning in new positions. */
+function atonalSets(r: Rng): number[][] {
+  const classes = [[0, 1, 4, 6], [0, 1, 3, 7], [0, 1, 4], [0, 2, 6], [0, 1, 5, 6], [0, 3, 4, 7], [0, 1, 2, 6]];
+  const set = r.pick(classes);
+  return Array.from({ length: 6 }, (_, k) => {
+    const t = (k * r.pick([5, 7, 11, 1])) % 12;
+    const inv = k % 2 === 1;
+    return set.map((x) => mod12((inv ? -x : x) + t));
+  });
+}
 
 export function compose(input: ComposeInput): ComposeResult {
   const { comp: c, settings: ps } = input;
   const style = STYLES[c.style];
+  const hs = input.harmony ?? {};
+  const behavior = hs.behavior ?? 'strict';
   const bb = barBeats(ps.timeSig);
   const beats = Math.max(4, Math.round(c.bars)) * bb;
   const R = rng(hash32(`compose:${c.seed}:${c.style}`));
   const sections = planSections(c, bb, R.fork('sections'));
   const n = scaleIntervals(ps.scale, ps.customScale).length;
-  const harmony = input.previousHarmony && c.locks.harmony
+  const atonal = c.style === 'atonal' && c.bypassScale;
+  const progression: ProgressionType = !hs.progression || hs.progression === 'auto' ? styleProgression(c.style, { behavior }, c) : hs.progression;
+  let harmony = input.previousHarmony?.length && c.locks.harmony
     ? input.previousHarmony
     : generateProgression({
-      type: c.tension > 0.7 && style.progression === 'sparse' ? 'tension' : style.progression,
-      beats, barBeats: bb, root: ps.key, scale: ps.scale, custom: ps.customScale,
-      harmonicRhythm: Math.max(0.5, style.harmonicRhythm * (1.3 - c.complexity * 0.6)), tension: c.tension,
-      chordSize: c.complexity > 0.66 ? 4 : 3, rng: R.fork('harmony'),
+      type: progression, beats, barBeats: bb, root: ps.key, scale: ps.scale, custom: ps.customScale,
+      harmonicRhythm: hs.rhythm && hs.rhythm > 0 ? hs.rhythm : Math.max(0.5, style.harmonicRhythm * (1.3 - c.complexity * 0.6)), tension: c.tension,
+      chordSize: hs.colour && hs.colour !== 'auto' ? undefined : style.colour === 'auto' ? (c.complexity > 0.66 ? 4 : 3) : undefined,
+      colour: hs.colour && hs.colour !== 'auto' ? hs.colour : style.colour, behavior, sequence: hs.sequence,
+      rng: R.fork(`harmony:${hs.seed ?? 1}`),
       guide: input.guide ? (t) => ({ degree: Math.round(curveValue(input.guide!, 'hue', t) * n) % n, strength: curveValue(input.guide!, 'saturation', t) }) : undefined,
     });
+  if (atonal) harmony = harmony.map((s) => ({ ...s, chord: chordFromQuality(s.chord.rootPc, 'cluster', -1), func: 'chromatic' as const }));
   const rowR = R.fork('row');
-  const row = Array.from({ length: 12 }, (_, i) => i);
-  for (let i = 11; i > 0; i--) { const j = rowR.int(0, i); [row[i], row[j]] = [row[j], row[i]]; }
-  const ctx: Ctx = { c, ps, style, bb, beats, harmony, sections, guide: input.guide, atonal: c.style === 'atonal' && c.bypassScale, row };
+  const sets = atonalSets(rowR);
+  const registers = Array.from({ length: 12 }, () => 12 * rowR.int(4, 5));
+  const mc = musicalContext(ps, { behavior, slots: harmony }, sections.map((s) => ({ start: s.start, end: s.start + s.bars * bb, name: s.name })));
+  const theme = makeMotif(R.fork('theme'), style.grammar, bb);
+  const theme2 = makeMotif(R.fork('theme2'), { ...style.grammar, count: [Math.max(1, style.grammar.count[0] - 1), style.grammar.count[1]], leap: Math.min(1, style.grammar.leap + 0.2) }, bb);
+  const ctx: Ctx = { c, ps, style, bb, beats, harmony, sections, guide: input.guide, atonal, sets, registers, mc, theme, theme2 };
 
   const layers: LayerOutput[] = [];
   for (const [lid, threshold] of Object.entries(style.layers) as [LayerId, number][]) {
+    if (lid === 'drums' && (!c.percussion || c.time === 'free')) continue;
     const key = `gen:${lid}`;
     if (input.only && input.only !== key) continue;
     const role = LAYER_ROLE[lid];
@@ -529,7 +737,7 @@ export function compose(input: ComposeInput): ComposeResult {
       let pi = 0;
       for (const sec of sections) {
         const phraseBars = style.phraseBars;
-        for (let pb = 0; pb < sec.bars; pb += phraseBars, pi++) {
+        for (let pb = 0, k = 0; pb < sec.bars; pb += phraseBars, pi++, k++) {
           const bars = Math.min(phraseBars, sec.bars - pb);
           const start = sec.start + pb * bb;
           const inten = intensityAt(ctx, sec, start);
@@ -537,16 +745,17 @@ export function compose(input: ComposeInput): ComposeResult {
           if (inten < threshold * (1.1 - c.complexity * 0.3) && threshold > 0) continue;
           const pr = R.fork(`${key}:${pi}`);
           const mem = memory.get(sec.variant);
-          const reuse = mem && pr.chance(c.repetition * (1 - c.variation * 0.5)) && role !== 'pad' && role !== 'drone';
+          // the melody develops its theme itself; other layers recall remembered phrases
+          const reuse = mem && role !== 'melody' && pr.chance(c.repetition * (1 - c.variation * 0.5)) && role !== 'pad' && role !== 'drone';
           let pattern: Pattern;
           if (reuse && mem) {
             const rd = rootDegree(chordAt(harmony, start));
             const shifted = shiftPattern(mem.pattern, start - mem.at, role === 'percussion' || role === 'texture' ? 0 : rd - mem.rootDeg, ctx, base, `${key}_${pi}`)
               .filter((x) => x.start < start + bars * bb - 1e-9);
             const progress = pi / Math.max(1, Math.ceil(c.bars / phraseBars));
-            pattern = mutate(shifted, c.mutation * (0.25 + c.evolution * progress), pr.fork('mut'), ctx, base, 1 / spec.subdiv);
+            pattern = mutate(shifted, c.mutation * (0.25 + c.evolution * progress), pr.fork('mut'), ctx, base, 1 / spec.subdiv, role);
           } else {
-            pattern = genPhrase(lid, ctx, sec, start, bars, pr, base, range, spec);
+            pattern = genPhrase(lid, ctx, sec, start, bars, pr, base, range, spec, { k, pi });
             memory.set(sec.variant, { pattern, at: start, rootDeg: rootDegree(chordAt(harmony, start)) });
           }
           notes.push(...pattern);
@@ -560,18 +769,91 @@ export function compose(input: ComposeInput): ComposeResult {
           return { ...o, midi: src.midi, degree: src.degree };
         });
       }
+      if (role !== 'percussion' && !(atonal && role !== 'pad')) notes = fitToHarmony(notes, role, ctx, base);
     }
     notes = notes.filter((x) => x.start < beats - 1e-9).sort((a, z) => a.start - z.start || a.midi - z.midi).map((x, k) => ({ ...x, id: `${key}_${k}` }));
     const patchName = style.patches[lid] ?? undefined;
     const patch = patchName ? instrument(patchName) : undefined;
     if (lid === 'drone2' && patch) { patch.osc1.detune += 7; patch.osc2.detune -= 7; }
     const out = layer(key, `${LAYER_NAME[lid]}`, role, sourceFor(role), {
-      patch, pitch: role === 'percussion' ? { mode: 'drums', low: 36, high: 56 } : ctx.atonal ? { mode: 'chromatic', low: range.low, high: range.high } : { ...range, mode: role === 'texture' ? 'chromatic' : 'scale' },
+      patch, pitch: role === 'percussion' ? { mode: 'drums', low: 36, high: 56 } : atonal || behavior === 'experimental' && role === 'texture' ? { mode: 'chromatic', low: range.low, high: range.high } : { ...range, mode: 'scale' },
       notes, rhythm: spec, automation: evolutionLanes(lid, ctx, R.fork(`auto:${key}`)), fx: styleFx(lid, c.style), mix: styleMix(lid, c.style),
     });
     layers.push(out);
   }
-  return { layers, harmony, sections, bpm: style.tempo };
+  if (c.time === 'free') {
+    const w = freeTimeWarp(beats, R.fork('breath'), c.irregularity);
+    for (const l of layers) l.notes = l.notes.map((x) => warpNote(x, w, l.role, R)).filter((x) => x.start < beats - 1e-9).sort((a, z) => a.start - z.start || a.midi - z.midi);
+    harmony = harmony.map((s) => { const a = w(s.start), z = w(s.start + s.dur); return { ...s, start: a, dur: z - a }; });
+  }
+  return { layers, harmony, sections, bpm: style.tempo, theme };
+}
+
+/** The final harmonic fit, by behaviour. Strict: every pitched note in the scale (harmony parts may
+ *  also voice their chord's flagged outside tones), melody downbeats on chord tones. Expressive:
+ *  in-scale except the chord's own tones. Experimental: untouched. Pitches move to the nearest
+ *  allowed tone, so contours survive. */
+function fitToHarmony(notes: NoteEvent[], role: Role, ctx: Ctx, base: number): NoteEvent[] {
+  const mc = ctx.mc;
+  if (mc.behavior === 'experimental') return notes;
+  const { ps } = ctx;
+  const harmonyPart = role === 'pad' || role === 'chords' || role === 'drone' || role === 'bass' || role === 'arp';
+  const chordPart = role === 'pad' || role === 'chords' || role === 'arp';
+  const arrived = new Set<ChordSlot>();
+  return [...notes].sort((a, b) => a.start - b.start).map((x) => {
+    const slot = slotAt(mc, x.start);
+    const allowed = harmonyPart ? [...new Set([...mc.pcs, ...slot.chord.pcs])] : mc.pcs;
+    let m = x.midi;
+    const pcsChord = slot.chord.pcs.filter((pc) => mc.pcs.includes(pc) || harmonyPart);
+    const w = beatStrength(ps.timeSig, ((x.start % ctx.bb) + ctx.bb) % ctx.bb);
+    // the bass's first note under a new chord is its bass note; pads, chord stabs and arpeggios
+    // play chord tones; strong beats of the bass and (Strict) the melody land on chord tones
+    const first = role === 'bass' && !arrived.has(slot) && x.start < slot.start + Math.min(slot.dur, ctx.bb) - 1e-6;
+    if (role === 'bass') arrived.add(slot);
+    if (first && mod12(m) !== slot.bassPc) {
+      const mm = place(slot.bassPc, m, Math.round(m) - 7, Math.round(m) + 7);
+      return { ...x, midi: mm, degree: inScale(mm, ps.key, ps.scale, ps.customScale) ? midiToDegree(mm, ps.key, ps.scale, base, ps.customScale) : undefined };
+    }
+    const needChord = (chordPart || (role === 'bass' && w >= 0.75) || (role === 'melody' && mc.behavior === 'strict' && w >= 0.75)) && pcsChord.length;
+    const ok = (mm: number) => allowed.includes(mod12(mm)) && (!needChord || pcsChord.includes(mod12(mm)));
+    if (ok(m) && Number.isInteger(m)) return x;
+    for (let d = 1; d <= 6; d++) {
+      if (ok(Math.round(m) - d)) { m = Math.round(m) - d; break; }
+      if (ok(Math.round(m) + d)) { m = Math.round(m) + d; break; }
+    }
+    const degree = inScale(m, ps.key, ps.scale, ps.customScale) ? midiToDegree(m, ps.key, ps.scale, base, ps.customScale) : undefined;
+    return { ...x, midi: m, degree };
+  });
+}
+
+/** Free time: one shared "breath" for the whole piece — stretches of slightly different speed
+ *  (rubato) whose boundaries fall at irregular places — so no layer sits on a grid or a pulse,
+ *  while chords and melody still move together. */
+function freeTimeWarp(beats: number, r: Rng, irregularity: number): (b: number) => number {
+  const pts: [number, number][] = [[0, 0]];
+  let x = 0, y = 0;
+  while (x < beats) {
+    const seg = 1.3 + r() * 3.4;
+    const rate = 0.6 + r() * (0.7 + irregularity * 0.5);
+    x += seg; y += seg * rate;
+    pts.push([x, y]);
+  }
+  const raw = (b: number) => {
+    let i = 1;
+    while (i < pts.length - 1 && pts[i][0] < b) i++;
+    const [x0, y0] = pts[i - 1], [x1, y1] = pts[i];
+    const f = x1 > x0 ? (b - x0) / (x1 - x0) : 0;
+    return y0 + (y1 - y0) * f;
+  };
+  const scale = beats / Math.max(1e-6, raw(beats));
+  return (b: number) => Math.max(0, raw(b) * scale);
+}
+
+function warpNote(x: NoteEvent, w: (b: number) => number, role: Role, r: Rng): NoteEvent {
+  const a = w(x.start), z = w(x.start + x.dur);
+  // melodic and textural events breathe a little more than the harmony around them
+  const jitter = role === 'melody' || role === 'texture' || role === 'arp' ? (r() - 0.5) * 0.24 : 0;
+  return { ...x, start: Math.max(0, a + jitter), dur: Math.max(0.05, z - a) };
 }
 
 function sourceFor(role: Role) {
@@ -587,6 +869,7 @@ function sourceFor(role: Role) {
 function styleFx(lid: LayerId, style: StyleId): EffectSlot[] | undefined {
   const id = (t: string) => `fx_gen_${lid}_${t}`;
   if (style === 'ambientDub' && lid === 'chords') return [fxSlot('filter', { mode: 1, cutoff: 600, res: 2 }, id('hp')), fxSlot('delay', { time: 0.6, feedback: 0.62, wet: 0.45 }, id('echo'))];
+  if (style === 'ambientDub' && lid === 'melody') return [fxSlot('delay', { time: 0.59, feedback: 0.55, wet: 0.38 }, id('echo'))];
   if (style === 'ambientDub' && lid === 'drums') return [fxSlot('pingpong', { time: 0.4, feedback: 0.4, wet: 0.18 }, id('pp'))];
   if ((style === 'ambient' || style === 'drone') && (lid === 'pad' || lid === 'drone')) return [fxSlot('atmosSweep', {}, id('sweep'))];
   if (style === 'motorik' && lid === 'arp') return [fxSlot('filter', { cutoff: 1400, res: 4 }, id('lp')), fxSlot('delay', { time: 0.357, feedback: 0.3, wet: 0.2 }, id('dl'))];
@@ -598,6 +881,7 @@ function styleFx(lid: LayerId, style: StyleId): EffectSlot[] | undefined {
 
 function styleMix(lid: LayerId, style: StyleId): Partial<Mix> | undefined {
   if (style === 'ambientDub' && lid === 'chords') return { delay: 0.5, reverb: 0.3, volume: -9 };
+  if (style === 'ambientDub' && lid === 'melody') return { delay: 0.45, reverb: 0.3 };
   if (style === 'ambientDub' && lid === 'drums') return { delay: 0.25, volume: -6 };
   if (lid === 'drone2') return { pan: 0.3, volume: -11 };
   if (lid === 'drone') return { pan: -0.2 };
@@ -651,3 +935,4 @@ export function blendByBars(oldNotes: NoteEvent[], newNotes: NoteEvent[], variat
   const barOf = (n: NoteEvent) => Math.floor(n.start / bb + 1e-9);
   return [...oldNotes.filter((n) => !takeNew[barOf(n)]), ...newNotes.filter((n) => takeNew[barOf(n)])].sort((a, z) => a.start - z.start);
 }
+

@@ -46,6 +46,16 @@ export function metricWeight(ts: TimeSigId, posInBar: Beats): number {
   return 0.15;
 }
 
+/** Harmonic strength of a position for melody writing (where non-chord tones need a reason).
+ *  Unlike metricWeight, a 4/4 bar is 1 · ½ · ¾ · ½ (beat 3 strong, 2 and 4 weak) and a 3/4 bar has
+ *  one strong beat; additive meters (5/4, 7/8, 9/8, 6/8) keep their group starts strong. */
+export function beatStrength(ts: TimeSigId, posInBar: Beats): number {
+  const w = metricWeight(ts, posInBar);
+  if (ts === '4/4') return Math.abs(posInBar - 2) < 1e-6 ? 0.8 : w === 0.75 ? 0.5 : w;
+  if (ts === '3/4') return w === 0.75 ? 0.5 : w;
+  return w;
+}
+
 /** Swing as a continuous time warp: inside each pair-cell the midpoint moves later by up
  *  to a triplet feel. Applied identically by the live scheduler, offline render and MIDI export. */
 export function swingBeat(b: Beats, swing: number, grid: 8 | 16): Beats {

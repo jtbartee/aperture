@@ -56,7 +56,7 @@ function geometry(): Project {
   S.push(stroke(drums.id, [{ x: 0.75, y: row(1) }, { x: 31.9, y: row(1) }], { kind: 'rhythm', density: 2, velocity: 0.5, probability: 0.45 }, 'line', id()));
   for (let b = 7.5; b < 32; b += 8) S.push(stroke(drums.id, [{ x: b, y: row(5) }], { kind: 'rhythm', density: 4, velocity: 0.55 }, 'dot', id()));
   p.strokes = S;
-  p.orbital.trackId = lead.id;
+  p.orbital.voices[0].trackId = lead.id;
   return deriveAll(p);
 }
 

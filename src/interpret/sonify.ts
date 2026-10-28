@@ -27,6 +27,7 @@ import type { FeatureGrid } from '../analysis/features';
 import { EDGE_BINS } from '../analysis/features';
 import { type ChordSlot, chordAt } from '../theory/progression';
 import { allowedPitches, mapY } from '../theory/scales';
+import { barBeats, beatStrength } from '../core/time';
 import { defaultSynthMap } from '../audio/imageSynth';
 
 const c01 = (x: number) => (x < 0 ? 0 : x > 1 ? 1 : x);
@@ -395,17 +396,27 @@ function shapeVoice(notes: NoteEvent[], i: VoiceInput, sp: PitchSpace, o: { W: n
       prev = n.midi;
     }
   }
-  // harmonic gravity: long notes lean to the image harmony's chord tones
+  // harmonic gravity: long notes lean to the image harmony's chord tones. With more structure
+  // (and less visual fidelity) phrase endings and strong-beat onsets lean too — by one scale step,
+  // two for a phrase ending, so the contour stays recognisable.
   if (o.Q >= 0.6 && i.harmony?.length) {
-    for (const n of notes) {
-      if (n.dur < 1 || n.bend || n.pitchY === undefined) continue;
-      const slot = chordAt(i.harmony, n.start);
-      if (!slot || slot.chord.pcs.includes(n.midi % 12)) continue;
-      for (const off of [1, -1]) {
+    const byTime = [...notes].sort((a, b) => a.start - b.start);
+    const bb = barBeats(i.ps.timeSig);
+    byTime.forEach((n, j) => {
+      if (n.bend || n.pitchY === undefined) return;
+      const next = byTime[j + 1];
+      const phraseEnd = !next || next.start - (n.start + n.dur) >= 1;
+      const pos = ((n.start % bb) + bb) % bb;
+      const strongOnset = Math.abs(pos - Math.round(pos)) < 0.02 && beatStrength(i.ps.timeSig, Math.round(pos) % bb) >= 0.75;
+      const musical = o.Q >= 0.75 && o.F < 0.9 && (phraseEnd || strongOnset);
+      if (n.dur < 1 && !musical) return;
+      const slot = chordAt(i.harmony!, n.start);
+      if (!slot || slot.chord.pcs.includes(n.midi % 12)) return;
+      for (const off of phraseEnd && o.F < 0.7 ? [1, -1, 2, -2] : [1, -1]) {
         const m = mapY(n.pitchY, sp.pitches, (n.stepOffset ?? 0) + off);
         if (slot.chord.pcs.includes(m % 12)) { n.stepOffset = (n.stepOffset ?? 0) + off; n.midi = m; break; }
       }
-    }
+    });
   }
   // harmonisation (musical interpretation): a diatonic third below the long note that opens a phrase
   const h = o.W * (1 - 0.85 * o.F);

@@ -1,10 +1,12 @@
-import type { Project, ProjectSettings } from '../core/types';
+import type { HarmonySettings, OrbitalSource, OrbitalVoice, Project, ProjectSettings } from '../core/types';
 import { uid } from '../core/ids';
 import { barBeats } from '../core/time';
 import { defaultComposition } from '../interpret/composer';
 import { defaultImageSettings } from '../interpret/imageModes';
 import { defaultPanoramaSettings, defaultRegions } from '../interpret/panorama';
 import { defaultParticles } from '../interpret/particles';
+import { defaultOrbitalVoice } from '../interpret/orbital';
+import { defaultHarmony } from '../theory/context';
 import { emptyTrack, PALETTE } from '../interpret/layers';
 import { fxSlot } from '../interpret/layers';
 import { legacyShape } from '../interpret/sonify';
@@ -31,7 +33,8 @@ export function newProject(name = 'Untitled'): Project {
     tracks: [lead, bass, pad, drums],
     strokes: [],
     composition: defaultComposition(),
-    orbital: { bars: 4, direction: 'cw', trackId: lead.id, strokes: [] },
+    harmony: defaultHarmony(),
+    orbital: { voices: [defaultOrbitalVoice(lead.id)], active: 'orb_1' },
     particles: defaultParticles(),
     modRoutes: [],
     scenes: [],
@@ -51,7 +54,8 @@ export function normalizeProject(raw: any): Project {
     version: 1,
     settings: { ...base.settings, ...(raw?.settings ?? {}), loop: { ...base.settings.loop, ...(raw?.settings?.loop ?? {}) } },
     composition: { ...base.composition, ...(raw?.composition ?? {}), locks: { ...base.composition.locks, ...(raw?.composition?.locks ?? {}) } },
-    orbital: { ...base.orbital, ...(raw?.orbital ?? {}) },
+    harmony: normalizeHarmony(raw),
+    orbital: normalizeOrbital(raw?.orbital, base.orbital),
     particles: { ...base.particles, ...(raw?.particles ?? {}) },
     tracks: Array.isArray(raw?.tracks) ? raw.tracks : base.tracks,
     strokes: Array.isArray(raw?.strokes) ? raw.strokes : [],
@@ -62,8 +66,31 @@ export function normalizeProject(raw: any): Project {
   };
   if (p.image) p.image = { ...p.image, settings: normalizeImageSettings(p.image.settings) };
   if (p.panorama) p.panorama = { ...p.panorama, settings: normalizePanoramaSettings(p.panorama.settings), regions: p.panorama.regions?.length ? p.panorama.regions : defaultRegions() };
-  if (!p.orbital.trackId || !p.tracks.some((t) => t.id === p.orbital.trackId)) p.orbital.trackId = p.tracks[0]?.id ?? '';
+  const firstTrack = p.tracks[0]?.id ?? '';
+  p.orbital = { ...p.orbital, voices: p.orbital.voices.map((v) => (p.tracks.some((t) => t.id === v.trackId) ? v : { ...v, trackId: firstTrack })) };
+  if (!p.orbital.voices.some((v) => v.id === p.orbital.active)) p.orbital.active = p.orbital.voices[0]?.id ?? '';
   return p;
+}
+
+/** Projects saved before the shared harmony existed: their composer lock becomes the harmony lock;
+ *  the timeline itself was never saved, so it starts empty (the next generation writes it). */
+function normalizeHarmony(raw: any): HarmonySettings {
+  const def = defaultHarmony();
+  const h = raw?.harmony;
+  if (!h) return { ...def, lock: !!raw?.composition?.locks?.harmony };
+  return { ...def, ...h, slots: Array.isArray(h.slots) ? h.slots : [] };
+}
+
+/** Orbital sources saved before voices existed become one voice that keeps the original
+ *  behaviour: radius → scale rows, a single revolution. */
+function normalizeOrbital(raw: any, base: OrbitalSource): OrbitalSource {
+  if (!raw) return base;
+  if (Array.isArray(raw.voices) && raw.voices.length) {
+    const voices: OrbitalVoice[] = raw.voices.map((v: any, i: number) => ({ ...defaultOrbitalVoice(v?.trackId ?? '', v?.id ?? `orb_${i + 1}`), ...v, strokes: Array.isArray(v?.strokes) ? v.strokes : [] }));
+    return { voices, active: raw.active ?? voices[0].id };
+  }
+  const legacy: OrbitalVoice = { ...defaultOrbitalVoice(raw.trackId ?? '', 'orb_1'), bars: raw.bars ?? 4, direction: raw.direction ?? 'cw', strokes: Array.isArray(raw.strokes) ? raw.strokes : [], pitch: 'scale', fill: false };
+  return { voices: [legacy], active: 'orb_1' };
 }
 
 /** Settings saved before the sonification overhaul have no rhythm mode. They keep the behaviour

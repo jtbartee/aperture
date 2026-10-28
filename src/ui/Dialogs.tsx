@@ -70,7 +70,15 @@ function ProjectsDialog({ onClose }: { onClose: () => void }) {
                 const p = await db.loadProject(m.id);
                 if (p) { const copy: Project = { ...structuredClone(p), id: uid('prj'), name: `${p.name} copy`, created: Date.now(), modified: Date.now() }; await db.saveProject(copy); refresh(); }
               }}>Duplicate</button>
-              <button className="btn small danger" disabled={m.id === current.id} onClick={async () => { if (confirm(`Delete “${m.name}” from this browser?`)) { await db.deleteProject(m.id); refresh(); } }}>Delete</button>
+              <button className="btn small danger" disabled={m.id === current.id} onClick={async () => {
+                if (!confirm(`Delete “${m.name}” from this browser?`)) return;
+                await db.deleteProject(m.id);
+                const s = useStore.getState();
+                const keep = new Set<string>();
+                for (const q of [s.project, ...s.past, ...s.future]) for (const id of [q.image?.asset.assetId, q.panorama?.asset.assetId]) if (id) keep.add(id);
+                await db.gcAssets(keep).catch(() => [] as string[]);
+                refresh();
+              }}>Delete</button>
             </span>
           </div>
         ))}
@@ -142,7 +150,11 @@ const STATUS: [string, 'ok' | 'part', string][] = [
   ['Effects: 14 insert types incl. Atmospheric Sweep; reverb/delay sends; modulation matrix', 'ok', 'Browser tested'],
   ['MIDI / WAV / stems / project / PNG / SVG / overlay export', 'ok', 'Automated + browser tested'],
   ['Scenes + arrangement printing', 'ok', 'Automated tests'],
-  ['Orbital and particle sequencers, custom scan path', 'ok', 'Automated tests; UI lightly tested'],
+  ['Harmony tab: shared key/scale/chords, Strict · Expressive · Experimental, 9 progression approaches incl. your own chords, lock, regenerate harmony only, live chord strip, “why this note”', 'ok', 'Automated + browser tested; demos measured, not yet reviewed by ear'],
+  ['Generative composition from a developed theme (sequence, fragmentation, inversion, augmentation, cadences); metric or free time; percussion optional', 'ok', 'Automated tests (acceptance A–K) + rendered audio'],
+  ['Orbital voices (several, harmony-following) and particle zone behaviours that complement them', 'ok', 'Automated + browser tested'],
+  ['Remove / replace / clear an image or panorama (keep or drop its music; undo; save and reopen)', 'ok', 'Browser tested incl. reload, undo, export and stored-file cleanup'],
+  ['Custom scan path', 'ok', 'Automated tests; UI lightly tested'],
   ['Web MIDI input (play, scale-lock, record)', 'part', 'Implemented; needs testing with hardware'],
   ['Bitcrusher', 'part', 'Bit-depth reduction only (no sample-rate reduction)'],
   ['GIF', 'part', 'First frame only (still-frame behaviour)'],
@@ -161,6 +173,8 @@ function HelpDialog({ onClose }: { onClose: () => void }) {
             <li><b>Image</b>: import a photo. Its contours are traced and each plays as a voice — left to right is time, height is pitch, gaps are silence. Switch between Photo, Contours and Overlay to see exactly what is heard. Shape the reading with Visual fidelity, Musical structure, Evolution and Event density; choose Free time, Image texture or Metric beat. Every derived layer is editable in the piano roll.</li>
             <li><b>Panorama</b>: import a very wide image; it scrolls under a fixed playhead. Ridgelines become voices over an evolving atmosphere whose timbre follows the scan; classic band and painted-region roles are still available.</li>
             <li><b>Generative</b>: choose a style and press Generate; guide it with your drawing or image; lock what you like and regenerate the rest.</li>
+            <li><b>Harmony</b> (inspector tab, and the strip above the stage): one key, scale and chord timeline for every workspace. Choose Strict, Expressive or Experimental, a progression approach or type your own chords; Orbital voices and Particle zones follow it.</li>
+            <li><b>Remove a picture</b> with <b>Remove…</b> on the Image or Panorama stage — keep its music or not; <b>Replace…</b> swaps the picture, <b>Clear generated notes</b> lets you regenerate it with other settings.</li>
             <li>Change sounds in <b>Sound</b>/<b>FX</b>; that never re-analyses the image. Changing the scale re-pitches notes without touching drawings.</li>
           </ul>
           <p className="note">Audio starts after your first click or key press (browser policy). Everything runs locally: no account, no uploads, no paid services.</p>
@@ -181,9 +195,30 @@ function HelpDialog({ onClose }: { onClose: () => void }) {
   );
 }
 
+/** Removing a source: take its music with it, or keep the music as independent layers. */
+function RemoveSourceDialog({ kind, onClose }: { kind: 'image' | 'panorama'; onClose: () => void }) {
+  const p = useStore((s) => s.project);
+  const st = useStore.getState();
+  const prefix = kind === 'image' ? 'image:' : 'pano:';
+  const layers = p.tracks.filter((t) => t.generator?.startsWith(prefix));
+  const noun = kind === 'image' ? 'image' : 'panorama';
+  return (
+    <Modal title={`Remove the ${noun}?`} onClose={onClose}>
+      <p>“{p[kind]?.asset.name}” has {layers.length} generated layer{layers.length === 1 ? '' : 's'} ({layers.reduce((n, t) => n + t.notes.length, 0)} notes). Drawings, Orbital and Particle material, the composer’s layers and every other track are not touched. You can undo this.</p>
+      <div className="choice">
+        <button className="btn danger" onClick={() => { st.removeSource(kind, false); onClose(); }}>Remove the {noun} and its layers<small>Layers that also hold your edits, drawings, Orbital or Particle notes are kept, without the {noun}’s notes.</small></button>
+        <button className="btn" onClick={() => { st.removeSource(kind, true); onClose(); }}>Remove the {noun}, keep its music<small>The layers stay as independent, editable tracks; they will not regenerate or disappear.</small></button>
+        <button className="btn" onClick={onClose}>Cancel</button>
+      </div>
+    </Modal>
+  );
+}
+
 export function Dialogs() {
   const dialog = useStore((s) => s.ui.dialog);
   const close = () => useStore.getState().setUi({ dialog: null });
+  if (dialog === 'removeImage') return <RemoveSourceDialog kind="image" onClose={close} />;
+  if (dialog === 'removePanorama') return <RemoveSourceDialog kind="panorama" onClose={close} />;
   if (dialog === 'projects') return <ProjectsDialog onClose={close} />;
   if (dialog === 'export') return <ExportDialog onClose={close} />;
   if (dialog === 'help') return <HelpDialog onClose={close} />;

@@ -2,7 +2,7 @@
 // Atmospheric and Hybrid modes add colour-, light- and texture-driven layers. Every mode produces
 // independent, editable layers keyed by generator id, so any single layer can be regenerated alone.
 
-import type { FeatureKey, ImageSettings, NoteEvent, ProjectSettings } from '../core/types';
+import type { ChordColour, FeatureKey, HarmonyBehavior, ImageSettings, NoteEvent, ProjectSettings } from '../core/types';
 import { hash32, rng, type Rng } from '../core/rng';
 import { barBeats, metricWeight } from '../core/time';
 import { type Curve, type CurveKey, type FeatureGrid, type MaskFn, curveSummary, curveValue, fullMask, bandMask, regionCurve } from '../analysis/features';
@@ -41,9 +41,15 @@ export const IMAGE_VOICE_KEYS = ['image:contour:lead', 'image:contour:counter', 
 
 const fv = (cv: Curve, key: FeatureKey, t01: number) => curveValue(cv, key as CurveKey | 'none', t01);
 
+/** The project's shared harmony as image/panorama generation sees it: locked slots replace the
+ *  image's own colour-guided harmony; behaviour, colour and seed shape the harmony it derives. */
+export interface MusicInput { slots?: ChordSlot[]; behavior?: HarmonyBehavior; colour?: ChordColour; seed?: number }
+
+const harmonySeed = (base: string, mi?: MusicInput) => hash32(mi?.seed && mi.seed !== 1 ? `${base}:${mi.seed}` : base);
+
 /** Harmony guided by colour: the image's dominant hue is "home"; other hues map to other degrees,
  *  colour coherence decides how strongly, saturation decides chord colour. */
-export function imageHarmony(cv: Curve, ps: ProjectSettings, beats: number, r: Rng, type?: ProgressionType): ChordSlot[] {
+export function imageHarmony(cv: Curve, ps: ProjectSettings, beats: number, r: Rng, type?: ProgressionType, mi?: MusicInput): ChordSlot[] {
   const s = curveSummary(cv);
   let hx = 0, hy = 0;
   for (let j = 0; j < cv.n; j++) { hx += Math.cos(cv.hue[j] * 2 * Math.PI) * cv.saturation[j]; hy += Math.sin(cv.hue[j] * 2 * Math.PI) * cv.saturation[j]; }
@@ -54,6 +60,7 @@ export function imageHarmony(cv: Curve, ps: ProjectSettings, beats: number, r: R
   return generateProgression({
     type: t, beats, barBeats: barBeats(ps.timeSig), root: ps.key, scale: ps.scale, custom: ps.customScale,
     harmonicRhythm: s.variation > 0.15 ? 1 : 2, tension: Math.min(1, s.contrast * 1.4), rng: r,
+    behavior: mi?.behavior ?? 'strict', colour: mi?.colour && mi.colour !== 'auto' ? mi.colour : undefined,
     guide: (t01) => {
       const hue = curveValue(cv, 'hue', t01);
       const rel = (hue - home + 1) % 1;
@@ -65,22 +72,22 @@ export function imageHarmony(cv: Curve, ps: ProjectSettings, beats: number, r: R
 const steps = (beats: number, perBeat: number) => Math.max(8, Math.round(beats * perBeat));
 
 /** Image mode scans left → right once: x maps linearly onto the piece. */
-function imageContext(a: ImageAnalysis, s: ImageSettings, ps: ProjectSettings, beats: number): SonicContext {
+function imageContext(a: ImageAnalysis, s: ImageSettings, ps: ProjectSettings, beats: number, mi?: MusicInput): SonicContext {
   const n = steps(beats, 2);
   const segs: ScanSeg[] = [{ t0: 0, t1: beats, x0: 0, x1: 1 }];
   const curve = (mask: MaskFn, o: { strip?: number; smoothing?: number } = {}) => regionCurve(a.grid, mask, { steps: n, sensitivity: s.contour.sensitivity, strip: o.strip ?? 0.5, smoothing: o.smoothing ?? s.smoothing });
   const full = curve(fullMask);
   return {
     grid: a.grid, set: a.contours, shape: s, density: s.density, ps, beats, segs, seed: s.seed, origin: 'image', curve,
-    harmony: imageHarmony(full, ps, beats, rng(hash32(`${s.seed}:image:harmony`))),
+    harmony: mi?.slots?.length ? mi.slots : imageHarmony(full, ps, beats, rng(harmonySeed(`${s.seed}:image:harmony`, mi)), undefined, mi),
     pxWidth: a.contours.width, aspect: a.contours.width / Math.max(1, a.contours.height), res: 1 / 64,
   };
 }
 
 // ---------------------------------------------------------------------- MODE A: contour
 
-export function contourLayers(a: ImageAnalysis, s: ImageSettings, ps: ProjectSettings, beats: number, only?: string): LayerOutput[] {
-  const ctx = imageContext(a, s, ps, beats);
+export function contourLayers(a: ImageAnalysis, s: ImageSettings, ps: ProjectSettings, beats: number, only?: string, mi?: MusicInput): LayerOutput[] {
+  const ctx = imageContext(a, s, ps, beats, mi);
   const out: LayerOutput[] = [];
   const want = (k: string) => !only || only === k;
   const specs = contourVoiceSpecs(ctx, 'rank', IMAGE_VOICE_KEYS).filter((v) => want(v.key));
@@ -159,15 +166,20 @@ export function colorLayers(a: ImageAnalysis, s: ImageSettings, ps: ProjectSetti
 
 // ---------------------------------------------------------------------- MODE C: atmospheric
 
-export function atmosLayers(a: ImageAnalysis, s: ImageSettings, ps: ProjectSettings, beats: number, only?: string): LayerOutput[] {
-  const n = steps(beats, 1);
-  const cv = regionCurve(a.grid, fullMask, { steps: n, sensitivity: s.contour.sensitivity, strip: 1.5, smoothing: Math.max(0.5, s.smoothing) });
+function atmosHarmony(a: ImageAnalysis, s: ImageSettings, ps: ProjectSettings, beats: number, mi?: MusicInput): { cv: Curve; harmony: ChordSlot[] } {
+  const cv = regionCurve(a.grid, fullMask, { steps: steps(beats, 1), sensitivity: s.contour.sensitivity, strip: 1.5, smoothing: Math.max(0.5, s.smoothing) });
   const sum = curveSummary(cv);
-  const harmony = imageHarmony(cv, ps, beats, rng(hash32(`${s.seed}:atmos:harmony`)), sum.variation < 0.06 ? 'static' : sum.variation < 0.14 ? 'sparse' : 'modal');
+  const harmony = mi?.slots?.length ? mi.slots : imageHarmony(cv, ps, beats, rng(harmonySeed(`${s.seed}:atmos:harmony`, mi)), sum.variation < 0.06 ? 'static' : sum.variation < 0.14 ? 'sparse' : 'modal', mi);
+  return { cv, harmony };
+}
+
+export function atmosLayers(a: ImageAnalysis, s: ImageSettings, ps: ProjectSettings, beats: number, only?: string, mi?: MusicInput): LayerOutput[] {
+  const { cv, harmony } = atmosHarmony(a, s, ps, beats, mi);
+  const sum = curveSummary(cv);
   const rhythm = s.rhythm;
   const params = { density: s.density * 0.7, threshold: 0.45 + (1 - s.density) * 0.3, polyphony: 6, quantize: 0, rhythm };
   const base = { settings: ps, beats, harmony, params, origin: 'image' as const };
-  const ctx = { ...imageContext(a, s, ps, beats), harmony };
+  const ctx = { ...imageContext(a, s, ps, beats, mi), harmony };
   const out: LayerOutput[] = [];
   const want = (k: string) => !only || only === k;
   if (want('image:atmos:pad')) {
@@ -224,11 +236,11 @@ function atmosFragments(cv: Curve, pitch: LayerOutput['pitch'], ps: ProjectSetti
 
 // ---------------------------------------------------------------------- HYBRID
 
-export function hybridLayers(a: ImageAnalysis, s: ImageSettings, ps: ProjectSettings, beats: number, only?: string): LayerOutput[] {
+export function hybridLayers(a: ImageAnalysis, s: ImageSettings, ps: ProjectSettings, beats: number, only?: string, mi?: MusicInput): LayerOutput[] {
   const out: LayerOutput[] = [];
   const want = (k: string) => !only || only.startsWith(k);
   const n = steps(beats, 2);
-  const ctx = imageContext(a, s, ps, beats);
+  const ctx = imageContext(a, s, ps, beats, mi);
   const full = ctx.curve(fullMask);
   const base = { settings: ps, beats, harmony: ctx.harmony, origin: 'image' as const };
   if (s.hybrid.contour) out.push(...contourVoiceLayers(ctx, contourVoiceSpecs(ctx, 'rank', IMAGE_VOICE_KEYS).filter((v) => want(v.key))));
@@ -259,16 +271,25 @@ export function hybridLayers(a: ImageAnalysis, s: ImageSettings, ps: ProjectSett
   return out;
 }
 
-export function generateImageLayers(a: ImageAnalysis, s: ImageSettings, ps: ProjectSettings, only?: string): LayerOutput[] {
+export function generateImageLayers(a: ImageAnalysis, s: ImageSettings, ps: ProjectSettings, only?: string, mi?: MusicInput): LayerOutput[] {
   const beats = s.bars * barBeats(ps.timeSig);
   let layers: LayerOutput[];
   switch (s.mode) {
-    case 'contour': layers = contourLayers(a, s, ps, beats, only); break;
+    case 'contour': layers = contourLayers(a, s, ps, beats, only, mi); break;
     case 'color': layers = colorLayers(a, s, ps, beats); break;
-    case 'atmos': layers = atmosLayers(a, s, ps, beats, only); break;
-    default: layers = hybridLayers(a, s, ps, beats, only);
+    case 'atmos': layers = atmosLayers(a, s, ps, beats, only, mi); break;
+    default: layers = hybridLayers(a, s, ps, beats, only, mi);
   }
   return only ? layers.filter((l) => l.key === only) : layers;
+}
+
+/** The harmony timeline image generation uses (what the project's shared harmony becomes when the
+ *  image writes it). Colour mode has no harmony of its own. */
+export function imageTimeline(a: ImageAnalysis, s: ImageSettings, ps: ProjectSettings, mi?: MusicInput): ChordSlot[] | null {
+  const beats = s.bars * barBeats(ps.timeSig);
+  if (s.mode === 'color') return null;
+  if (s.mode === 'atmos') return atmosHarmony(a, s, ps, beats, mi).harmony;
+  return imageContext(a, s, ps, beats, mi).harmony;
 }
 
 export { ROLE_RANGE };

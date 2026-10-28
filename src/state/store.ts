@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import type {
-  BrushSettings, CompositionSettings, EffectSlot, ImageSettings, Mix, NoteEvent, PanoramaSettings, Project, ProjectSettings,
+  BrushSettings, CompositionSettings, EffectSlot, HarmonySettings, ImageSettings, Mix, NoteEvent, PanoramaSettings, Project, ProjectSettings,
   Region, RhythmSpec, Stroke, SynthPatch, Track, Workspace, ShapeKind,
 } from '../core/types';
 import { uid } from '../core/ids';
@@ -11,15 +11,15 @@ import { defaultBrush } from '../interpret/strokes';
 import { deriveStrokes } from '../interpret/derive';
 import { remapProject, remapTrack } from '../interpret/remap';
 import { type LayerOutput, PALETTE, trackFromLayer, emptyTrack } from '../interpret/layers';
-import { defaultImageSettings, generateImageLayers } from '../interpret/imageModes';
-import { defaultPanoramaSettings, defaultRegions, generatePanoramaLayers, panoramaBeats, scanPath, regionMask } from '../interpret/panorama';
+import { defaultImageSettings, generateImageLayers, imageTimeline } from '../interpret/imageModes';
+import { defaultPanoramaSettings, defaultRegions, generatePanoramaLayers, panoramaBeats, panoramaTimeline, scanPath, regionMask } from '../interpret/panorama';
 import { blendByBars, compose, drawingCurve } from '../interpret/composer';
-import { orbitalNotes } from '../interpret/orbital';
-import { simulateParticles } from '../interpret/particles';
+import { retargetSlots } from '../theory/progression';
+import { musicInput, panelTimeline, publishHarmony, refreshSequencers, tonicTimeline, withParticles, withoutSource, withoutSourceNotes } from './music';
 import { bakeRoute } from '../interpret/modmatrix';
 import { captureScene, printArrangement } from '../interpret/scenes';
 import { fullMask, regionCurve, type Curve } from '../analysis/features';
-import { AnalysisCancelled, analyzeBitmap, buildLevels, contoursStale, decodeImage, getAnalysis, rerunContours } from '../analysis/client';
+import { AnalysisCancelled, analyzeBitmap, buildLevels, contoursStale, decodeImage, forgetAsset, getAnalysis, rerunContours } from '../analysis/client';
 import * as db from '../persist/db';
 import { newProject, normalizeProject } from './project';
 import { instrument } from '../audio/patches';
@@ -37,7 +37,7 @@ export interface UIState {
   selStrokes: string[];
   selNotes: string[]; // note ids on the selected track
   showNotes: boolean;
-  inspectorTab: 'track' | 'sound' | 'fx' | 'source' | 'mod';
+  inspectorTab: 'track' | 'sound' | 'fx' | 'source' | 'mod' | 'harmony';
   bottomTab: 'mixer' | 'roll' | 'scenes';
   bottomOpen: boolean;
   leftOpen: boolean;
@@ -51,7 +51,7 @@ export interface UIState {
   panoTool: 'scrub' | 'paint' | 'erase' | 'lasso' | 'path';
   paintRegionId: string;
   pendingRegen: string | null;
-  dialog: null | 'projects' | 'export' | 'help' | 'about';
+  dialog: null | 'projects' | 'export' | 'help' | 'about' | 'removeImage' | 'removePanorama';
   hoverInfo: string;
 }
 
@@ -106,6 +106,13 @@ interface Store {
   bakeModMatrix(): void;
   regenerateOrbital(): void;
   regenerateParticles(): void;
+  // shared harmony
+  setHarmony(patch: Partial<HarmonySettings>, regenerate?: boolean): void;
+  regenerateHarmony(newSeed?: boolean): void;
+  // image / panorama sources
+  removeSource(kind: 'image' | 'panorama', keepMusic: boolean): void;
+  clearSourceNotes(kind: 'image' | 'panorama'): void;
+  replaceSource(kind: 'image' | 'panorama', file: Blob, name: string): Promise<void>;
   // scenes
   saveScene(name: string): void;
   recallScene(id: string): void;
@@ -119,6 +126,7 @@ interface Store {
 }
 
 const HISTORY_LIMIT = 120;
+
 let analysisAborts: Record<string, AbortController | undefined> = {};
 let toastId = 0;
 
@@ -197,12 +205,14 @@ export const useStore = create<Store>((set, get) => {
       if (!past.length) return;
       set({ project: past[past.length - 1], past: past.slice(0, -1), future: [project, ...future].slice(0, HISTORY_LIMIT) });
       set((s) => ({ ui: { ...s.ui, saveState: 'unsaved' } }));
+      ensureAnalyses();
     },
     redo: () => {
       const { past, project, future } = get();
       if (!future.length) return;
       set({ project: future[0], future: future.slice(1), past: [...past, project] });
       set((s) => ({ ui: { ...s.ui, saveState: 'unsaved' } }));
+      ensureAnalyses();
     },
 
     setSettings: (patch) => {
@@ -216,8 +226,9 @@ export const useStore = create<Store>((set, get) => {
           if (Math.abs(pp.settings.loop.end - oldEnd) < 1e-6 || settings.loop.end > newEnd) settings = { ...settings, loop: { ...settings.loop, end: newEnd, start: Math.min(settings.loop.start, Math.max(0, newEnd - 1)) } };
         }
         let next: Project = { ...pp, settings };
-        if (pitchChanged) next = remapProject(next);
+        if (pitchChanged) next = { ...remapProject(next), harmony: { ...pp.harmony, slots: retargetSlots(pp.harmony.slots, pp.settings, settings) } };
         if (patch.timeSig !== undefined) next = deriveStrokes(next, new Set(next.strokes.map((s) => s.id)));
+        if (pitchChanged || patch.timeSig !== undefined || patch.lengthBars !== undefined) next = refreshSequencers(next);
         return next;
       });
       if (patch.bpm !== undefined) engine.retempo();
@@ -323,10 +334,17 @@ export const useStore = create<Store>((set, get) => {
       job({ status: 'running', progress: 0, label: 'Decoding…', error: undefined });
       try {
         const bmp = await decodeImage(file);
+        const old = get().project[kind];
+        if (old) {
+          // replacing: the old source's notes and analysis must never attach to the new picture
+          const keep = kind === 'image' ? { ...(old.settings as ImageSettings) } : { ...(old.settings as PanoramaSettings), path: [], genBeats: undefined };
+          dropSource(kind, false);
+          preset = { ...keep, ...(preset ?? {}) } as typeof preset;
+        }
         const assetId = uid('img');
         try { await db.putAsset(assetId, file); } catch (e) { get().toast(`Image kept in memory only: ${(e as Error).message}`, 'error'); }
         await buildLevels(assetId, bmp, kind);
-        const asset = { assetId, name, mime: file.type || 'image/png', width: bmp.width, height: bmp.height, bytes: file.size };
+        const asset = { assetId, name: name || 'image', mime: file.type || 'image/png', width: bmp.width, height: bmp.height, bytes: file.size };
         get().commit((p) => kind === 'image'
           ? { ...p, image: { asset, settings: { ...(p.image?.settings ?? defaultImageSettings()), ...(preset as Partial<ImageSettings>) } }, workspace: 'image' }
           : { ...p, panorama: { asset, settings: { ...(p.panorama?.settings ?? defaultPanoramaSettings()), ...(preset as Partial<PanoramaSettings>), genBeats: undefined }, regions: p.panorama?.regions ?? defaultRegions() }, workspace: 'panorama' });
@@ -361,10 +379,11 @@ export const useStore = create<Store>((set, get) => {
           kind, signal: ac.signal, contours,
           onProgress: (f, stage) => job({ progress: f, label: stage === 'tiles' ? 'Reading image tiles…' : stage === 'features' ? 'Measuring colour, light and texture…' : stage === 'contours' ? 'Tracing contours…' : 'Done' }),
         });
-        job({ status: 'done', progress: 1, label: 'Analysis ready' });
         // the full-resolution bitmap is no longer needed once tiles + display levels exist
         bmp.close();
         assetBitmaps.delete(src.asset.assetId);
+        if (get().project[kind]?.asset.assetId !== src.asset.assetId) { forgetAsset(src.asset.assetId); return; }
+        job({ status: 'done', progress: 1, label: 'Analysis ready' });
         if (kind === 'image') get().generateImage();
         else get().generatePanorama();
       } catch (e) {
@@ -390,11 +409,18 @@ export const useStore = create<Store>((set, get) => {
       if (!p.image) return;
       const a = getAnalysis(p.image.asset.assetId);
       if (!a) { get().toast('Analyse the image first.', 'error'); return; }
-      const layers = generateImageLayers(a, p.image.settings, p.settings, only);
+      const mi = musicInput(p);
+      const is = p.image.settings;
+      const layers = generateImageLayers(a, is, p.settings, only, mi);
+      // the image writes the shared harmony when its chords are audible (high structure, or modes
+      // whose pads/bass voice them); otherwise it is tonal-centred and publishes the tonic alone
+      const follows = is.mode === 'atmos' || is.structure >= 0.6 || (is.mode === 'hybrid' && (is.hybrid.pads || is.hybrid.bass));
+      const timeline = only ? null : follows ? imageTimeline(a, is, p.settings, mi) : tonicTimeline(p, is.bars * barBeats(p.settings.timeSig));
       atBoundary('image', () => {
         get().applyLayers('image:', layers, { only });
         const bars = p.image!.settings.bars;
         if (!only && get().project.settings.lengthBars < bars) get().setSettings({ lengthBars: bars });
+        get().commit((q) => refreshSequencers(publishHarmony(q, timeline, 'image')), false);
         get().bakeModMatrix();
       });
     },
@@ -414,9 +440,14 @@ export const useStore = create<Store>((set, get) => {
       if (!p.panorama) return;
       const a = getAnalysis(p.panorama.asset.assetId);
       if (!a) { get().toast('Analyse the panorama first.', 'error'); return; }
-      const layers = generatePanoramaLayers(a, p.panorama, p.settings, only);
+      const mi = musicInput(p);
+      const s = p.panorama.settings;
+      const layers = generatePanoramaLayers(a, p.panorama, p.settings, only, mi);
+      const follows = s.layers.regions || s.structure >= 0.6;
+      const timeline = only ? null : follows ? panoramaTimeline(a, p.panorama, p.settings, mi) : tonicTimeline(p, panoramaBeats(s, p.settings));
       atBoundary('panorama', () => {
         get().applyLayers('pano:', layers, { only });
+        get().commit((q) => publishHarmony(q, timeline, 'panorama'), false);
         const pp = get().project;
         const beats = panoramaBeats(pp.panorama!.settings, pp.settings);
         const bars = Math.ceil(beats / barBeats(pp.settings.timeSig) - 1e-6);
@@ -424,6 +455,7 @@ export const useStore = create<Store>((set, get) => {
           get().setSettings({ lengthBars: bars, loop: { on: pp.settings.loop.on, start: 0, end: beats } });
           get().commit((q) => (q.panorama ? { ...q, panorama: { ...q.panorama, settings: { ...q.panorama.settings, genBeats: beats } } } : q), false);
         }
+        get().commit(refreshSequencers, false);
         get().bakeModMatrix();
       });
     },
@@ -435,8 +467,8 @@ export const useStore = create<Store>((set, get) => {
       if (c.source !== 'none' && !guide) get().toast(`No ${c.source} source yet — composing from the seed alone.`, 'info');
       const previous = new Map(p.tracks.filter((t) => t.generator?.startsWith('gen:')).map((t) => [t.generator!, { notes: t.notes, rhythm: t.rhythm }]));
       const rhythms = new Map(p.tracks.filter((t) => t.generator?.startsWith('gen:') && only === t.generator).map((t) => [t.generator!, t.rhythm]));
-      const res = compose({ comp: c, settings: p.settings, guide, previous, previousHarmony: lastHarmony, only, rhythms });
-      lastHarmony = res.harmony;
+      const h = p.harmony;
+      const res = compose({ comp: { ...c, locks: { ...c.locks, harmony: h.lock } }, settings: p.settings, guide, previous, previousHarmony: h.slots, only, rhythms, harmony: h });
       lastSections = res.sections;
       atBoundary('composition', () => {
         get().applyLayers('gen:', res.layers, { only });
@@ -445,7 +477,7 @@ export const useStore = create<Store>((set, get) => {
           if (applyTempo) patch.bpm = res.bpm;
           get().setSettings(patch);
           const bb = barBeats(get().project.settings.timeSig);
-          get().commit((pp) => ({ ...pp, markers: res.sections.map((s) => ({ beat: s.start, label: s.name })), settings: { ...pp.settings, loop: { ...pp.settings.loop, start: 0, end: c.bars * bb } } }), false);
+          get().commit((pp) => refreshSequencers(publishHarmony({ ...pp, markers: res.sections.map((s) => ({ beat: s.start, label: s.name })), settings: { ...pp.settings, loop: { ...pp.settings.loop, start: 0, end: c.bars * bb } } }, res.harmony, 'generative')), false);
         }
       });
     },
@@ -458,19 +490,19 @@ export const useStore = create<Store>((set, get) => {
       const seedBump = get().project.tracks.find((x) => x.id === trackId)!.seed;
       const p = get().project;
       if (g.startsWith('gen:')) {
-        const c = { ...p.composition, seed: (p.composition.seed + seedBump) >>> 0, locks: { ...p.composition.locks, harmony: true } };
-        const res = compose({ comp: c, settings: p.settings, previous: new Map([[g, { notes: t.notes, rhythm: t.rhythm }]]), previousHarmony: lastHarmony, only: g, rhythms: new Map([[g, t.rhythm]]) });
+        const c = { ...p.composition, seed: (p.composition.seed + seedBump) >>> 0, locks: { ...p.composition.locks, harmony: p.harmony.slots.length > 0 } };
+        const res = compose({ comp: c, settings: p.settings, previous: new Map([[g, { notes: t.notes, rhythm: t.rhythm }]]), previousHarmony: p.harmony.slots, only: g, rhythms: new Map([[g, t.rhythm]]), harmony: p.harmony });
         atBoundary('track', () => get().applyLayers('gen:', res.layers, { only: g }));
       } else if (g.startsWith('image:') && p.image) {
         const a = getAnalysis(p.image.asset.assetId);
         if (!a) { get().toast('Analyse the image first.', 'error'); return; }
-        const layers = generateImageLayers(a, { ...p.image.settings, seed: (p.image.settings.seed + seedBump) >>> 0 }, p.settings, g);
+        const layers = generateImageLayers(a, { ...p.image.settings, seed: (p.image.settings.seed + seedBump) >>> 0 }, p.settings, g, { ...musicInput(p), slots: p.harmony.slots.length ? p.harmony.slots : undefined });
         atBoundary('track', () => get().applyLayers('image:', layers, { only: g }));
       } else if (g.startsWith('pano:') && p.panorama) {
         const a = getAnalysis(p.panorama.asset.assetId);
         if (!a) { get().toast('Analyse the panorama first.', 'error'); return; }
         const src = { ...p.panorama, settings: { ...p.panorama.settings, seed: (p.panorama.settings.seed + seedBump) >>> 0 } };
-        atBoundary('track', () => get().applyLayers('pano:', generatePanoramaLayers(a, src, p.settings, g), { only: g }));
+        atBoundary('track', () => get().applyLayers('pano:', generatePanoramaLayers(a, src, p.settings, g, { ...musicInput(p), slots: p.harmony.slots.length ? p.harmony.slots : undefined }), { only: g }));
       }
     },
     setTrackRhythm: (trackId, r) => get().updateTrack(trackId, (t) => ({ ...t, rhythm: { ...t.rhythm, ...r } })),
@@ -489,28 +521,44 @@ export const useStore = create<Store>((set, get) => {
         }),
       }), false);
     },
-    regenerateOrbital: () => {
-      const p = get().project;
-      const track = p.tracks.find((t) => t.id === p.orbital.trackId);
-      if (!track) return;
-      const { notes, pan } = orbitalNotes(p.orbital, track, p.settings);
-      get().updateTrack(track.id, (t) => ({
-        ...t, notes: [...t.notes.filter((n) => n.origin !== 'orbital'), ...notes].sort((a, b) => a.start - b.start),
-        automation: [...t.automation.filter((a) => a.id !== 'orbital_pan'), ...(pan ? [pan] : [])],
-      }));
+    // the orbit changes what particles should complement, so both are refreshed together
+    regenerateOrbital: () => get().commit(refreshSequencers),
+    regenerateParticles: () => get().commit(withParticles),
+
+    setHarmony: (patch, regenerate = false) => {
+      get().commit((p) => ({ ...p, harmony: { ...p.harmony, ...patch } }));
+      if (regenerate && !get().project.harmony.lock) get().regenerateHarmony(false);
+      else get().commit(refreshSequencers, false);
     },
-    regenerateParticles: () => {
+    regenerateHarmony: (newSeed = true) => {
+      if (get().project.harmony.lock) { get().toast('Harmony is locked — unlock it to write new chords.', 'info'); return; }
+      if (newSeed) get().commit((p) => ({ ...p, harmony: { ...p.harmony, seed: (p.harmony.seed % 99999) + 1 } }));
       const p = get().project;
-      const sim = simulateParticles(p.particles, p.tracks, p.settings);
-      get().commit((pp) => ({
-        ...pp,
-        tracks: pp.tracks.map((t) => {
-          const add = sim.notes.get(t.id) ?? [];
-          const had = t.notes.some((n) => n.origin === 'particle');
-          if (!add.length && !had) return t;
-          return { ...t, notes: [...t.notes.filter((n) => n.origin !== 'particle'), ...add.map((n) => ({ ...n, id: `${t.id}_${n.id}` }))].sort((a, b) => a.start - b.start) };
-        }),
-      }));
+      const author = p.harmony.author;
+      const hasGen = p.tracks.some((t) => t.generator?.startsWith('gen:'));
+      // the source that owns the timeline rewrites it, and its layers follow the new chords; the
+      // themes, rhythms and contours stay (their seeds are unchanged)
+      if ((author === 'generative' || author === 'none') && hasGen) { get().generateComposition(); return; }
+      if (author === 'image' && p.image && getAnalysis(p.image.asset.assetId)) { get().generateImage(); return; }
+      if (author === 'panorama' && p.panorama && getAnalysis(p.panorama.asset.assetId)) { get().generatePanorama(); return; }
+      atBoundary('harmony', () => get().commit((q) => refreshSequencers({ ...q, harmony: { ...q.harmony, slots: panelTimeline(q), author: 'harmony' } }), false));
+    },
+
+    removeSource: (kind, keepMusic) => {
+      const src = get().project[kind];
+      if (!src) return;
+      dropSource(kind, keepMusic);
+      get().bakeModMatrix();
+      get().toast(keepMusic ? `${kind === 'image' ? 'Image' : 'Panorama'} removed — its music stays as editable layers.` : `${kind === 'image' ? 'Image' : 'Panorama'} and its layers removed.`, 'ok');
+    },
+    clearSourceNotes: (kind) => {
+      if (!get().project[kind]) return;
+      get().commit((p) => withoutSourceNotes(p, kind));
+      get().toast('Generated notes cleared — the picture is still here; Generate to read it again.', 'ok');
+    },
+    replaceSource: async (kind, file, name) => {
+      // importImage replaces an existing source cleanly (see dropSource)
+      await get().importImage(file, name, kind);
     },
 
     saveScene: (name) => get().commit((p) => ({ ...p, scenes: [...p.scenes, captureScene(p, uid('scn'), name || `Scene ${p.scenes.length + 1}`)] })),
@@ -537,7 +585,6 @@ export const useStore = create<Store>((set, get) => {
       const p = normalizeProject(raw);
       for (const a of assets) { try { await db.putAsset(a.id, a.blob); } catch { /* memory only */ } }
       set((s) => ({ project: p, past: [], future: [], ui: { ...s.ui, selectedTrackId: p.tracks[0]?.id ?? '', selStrokes: [], selNotes: [], saveState: 'unsaved', analysis: { image: { status: 'idle', progress: 0, label: '' }, panorama: { status: 'idle', progress: 0, label: '' } } } }));
-      lastHarmony = undefined;
       db.setLastProjectId(p.id);
       // rebuild display levels + analysis from stored assets (notes are already in the project)
       for (const kind of ['image', 'panorama'] as const) {
@@ -561,6 +608,13 @@ export const useStore = create<Store>((set, get) => {
       try {
         await db.saveProject(p);
         db.setLastProjectId(p.id);
+        if (assetsDirty) {
+          assetsDirty = false;
+          const { past, future } = get();
+          const keep = new Set<string>();
+          for (const q of [p, ...past, ...future]) for (const id of [q.image?.asset.assetId, q.panorama?.asset.assetId]) if (id) keep.add(id);
+          void db.gcAssets(keep).catch(() => { /* storage may be unavailable */ });
+        }
         if (get().project === p) set((s) => ({ ui: { ...s.ui, saveState: 'saved' } }));
       } catch (e) {
         set((s) => ({ ui: { ...s.ui, saveState: 'error' } }));
@@ -569,6 +623,34 @@ export const useStore = create<Store>((set, get) => {
     },
   };
   return store;
+
+  /** Take a source out: cancel its analysis, drop its caches and bitmap, remove or detach its
+   *  layers (one undoable step). The stored blob stays until no project or undo step needs it. */
+  function dropSource(kind: 'image' | 'panorama', keepMusic: boolean) {
+    const src = get().project[kind];
+    if (!src) return;
+    analysisAborts[kind]?.abort();
+    analysisAborts[kind] = undefined;
+    const id = src.asset.assetId;
+    get().commit((p) => withoutSource(p, kind, keepMusic));
+    forgetAsset(id);
+    assetBitmaps.get(id)?.close();
+    assetBitmaps.delete(id);
+    assetsDirty = true;
+    set((s) => ({ ui: { ...s.ui, analysis: { ...s.ui.analysis, [kind]: { status: 'idle', progress: 0, label: '' } }, dialog: null } }));
+  }
+
+  /** After undo / redo a restored source may have had its caches dropped: rebuild them. */
+  function ensureAnalyses() {
+    const p = get().project;
+    for (const kind of ['image', 'panorama'] as const) {
+      const src = p[kind];
+      if (!src || getAnalysis(src.asset.assetId) || get().ui.analysis[kind].status === 'running') continue;
+      void db.getAsset(src.asset.assetId).catch(() => undefined).then((blob) => {
+        if (blob && get().project[kind]?.asset.assetId === src.asset.assetId) reanalyze(kind, blob, src.asset.assetId);
+      });
+    }
+  }
 
   async function reanalyze(kind: 'image' | 'panorama', blob: Blob, assetId: string) {
     try {
@@ -579,6 +661,7 @@ export const useStore = create<Store>((set, get) => {
       set((s) => ({ ui: { ...s.ui, analysis: { ...s.ui.analysis, [kind]: { status: 'running', progress: 0.1, label: 'Re-analysing stored image…' } } } }));
       await analyzeBitmap(assetId, bmp, { kind, contours });
       bmp.close();
+      if (get().project[kind]?.asset.assetId !== assetId) { forgetAsset(assetId); return; }
       set((s) => ({ ui: { ...s.ui, analysis: { ...s.ui.analysis, [kind]: { status: 'done', progress: 1, label: 'Analysis ready' } } } }));
     } catch (e) {
       set((s) => ({ ui: { ...s.ui, analysis: { ...s.ui.analysis, [kind]: { status: 'error', progress: 0, label: 'Analysis failed', error: (e as Error).message } } } }));
@@ -586,9 +669,10 @@ export const useStore = create<Store>((set, get) => {
   }
 });
 
-let lastHarmony: ReturnType<typeof compose>['harmony'] | undefined;
 export let lastSections: ReturnType<typeof compose>['sections'] = [];
-export const getHarmony = () => lastHarmony;
+/** The shared harmony timeline (persisted in the project). */
+export const getHarmony = () => useStore.getState().project.harmony.slots;
+let assetsDirty = false;
 const assetBitmaps = new Map<string, ImageBitmap>();
 
 /** The single live engine; it reads the current project on every scheduler tick. */
@@ -618,3 +702,4 @@ useStore.subscribe((s) => {
 export const selectedTrack = (s: { project: Project; ui: UIState }) => s.project.tracks.find((t) => t.id === s.ui.selectedTrackId) ?? s.project.tracks[0];
 
 export { remapTrack, regionMask, instrument };
+export { autoProgression, projectContext, refreshSequencers } from './music';

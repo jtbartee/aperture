@@ -1,11 +1,15 @@
 import { useEffect, useState } from 'react';
 import * as Tone from 'tone';
-import { engine, useStore } from '../state/store';
+import { engine, projectContext, useStore } from '../state/store';
+import { explain, slotAt } from '../theory/context';
+import { chordSymbol } from '../theory/chords';
+import { pcName } from '../theory/scales';
 import * as db from '../persist/db';
 import type { Workspace } from '../core/types';
 import { Toolbar, importFile } from './Toolbar';
 import { Sidebar } from './Sidebar';
 import { Inspector } from './Inspector';
+import { HarmonyNow } from './panels/HarmonyPanel';
 import { Bottom } from './Bottom';
 import { DrawCanvas } from './workspaces/DrawCanvas';
 import { ImageView } from './workspaces/ImageView';
@@ -59,6 +63,7 @@ export function App() {
       api: {
         renderOffline, peakAndRms, projectToMidi, INSTRUMENTS, instrument, getAnalysis, getLevels, scanPoint, displayBeats, darkUniform, colorfulTexture, rgbaToPng,
         hazeImage, ridgesImage, irregularBars, uniformImage, contourFixture, panoramaLandscape, contourPreset, encodeWav,
+        listAssetIds: db.listAssetIds, projectContext, explain, slotAt, chordSymbol, pcName,
       },
       liveRms: () => {
         const a = engine.graph?.analyser;
@@ -130,7 +135,7 @@ export function App() {
           {WORKSPACES.map((w, i) => (
             <button key={w.id} role="tab" className="ws-tab" aria-selected={ws === w.id} title={`${w.hint} (⌥${i + 1})`} onClick={() => useStore.getState().setWorkspace(w.id)}>{w.label}</button>
           ))}
-          <span className="ws-hint">{WORKSPACES.find((w) => w.id === ws)?.hint}</span>
+          <HarmonyNow compact />
         </div>
         <div className="stage">
           <ErrorBoundary key={ws} label="This workspace">{view}</ErrorBoundary>

@@ -57,6 +57,135 @@ try {
   const S = (fn, arg) => page.evaluate(fn, arg);
   await page.mouse.click(700, 400); // user gesture → audio
   await page.waitForFunction(() => window.__aperture.engine.ready, null, { timeout: 10000 });
+  // page-side audio analysis: STFT features, spectral-flux onsets, click audit, spectrogram
+  const installAudio = () => S(() => {
+      const fft = (re, im) => {
+        const n = re.length;
+        for (let i = 1, j = 0; i < n; i++) { let bit = n >> 1; for (; j & bit; bit >>= 1) j ^= bit; j ^= bit; if (i < j) { [re[i], re[j]] = [re[j], re[i]]; [im[i], im[j]] = [im[j], im[i]]; } }
+        for (let len = 2; len <= n; len <<= 1) {
+          const ang = (-2 * Math.PI) / len, wr = Math.cos(ang), wi = Math.sin(ang);
+          for (let i = 0; i < n; i += len) { let cr = 1, ci = 0; for (let k = 0; k < len / 2; k++) { const ar = re[i + k], ai = im[i + k], br = re[i + k + len / 2] * cr - im[i + k + len / 2] * ci, bi = re[i + k + len / 2] * ci + im[i + k + len / 2] * cr; re[i + k] = ar + br; im[i + k] = ai + bi; re[i + k + len / 2] = ar - br; im[i + k + len / 2] = ai - bi; const t = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = t; } }
+        }
+      };
+      const mono = (b) => { const a = b.getChannelData(0), c = b.numberOfChannels > 1 ? b.getChannelData(1) : a; const m = new Float32Array(a.length); for (let i = 0; i < a.length; i++) m[i] = (a[i] + c[i]) / 2; return m; };
+      const stft = (b, N = 2048, H = 1024) => {
+        const x = mono(b), win = new Float32Array(N).map((_, i) => 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / N));
+        const frames = [];
+        for (let s0 = 0; s0 + N <= x.length; s0 += H) {
+          const re = new Float32Array(N), im = new Float32Array(N);
+          let e = 0;
+          for (let i = 0; i < N; i++) { re[i] = x[s0 + i] * win[i]; e += x[s0 + i] ** 2; }
+          fft(re, im);
+          const mag = new Float32Array(N / 2);
+          for (let k = 0; k < N / 2; k++) mag[k] = Math.hypot(re[k], im[k]);
+          frames.push({ t: (s0 + N / 2) / b.sampleRate, rms: Math.sqrt(e / N), mag });
+        }
+        return frames;
+      };
+      window.__audio = {
+        features(b) {
+          const fr = stft(b);
+          const sr = b.sampleRate, N = 2048;
+          let peak = 0, over = 0, n = 0, sq = 0;
+          for (let c = 0; c < b.numberOfChannels; c++) { const d = b.getChannelData(c); for (let i = 0; i < d.length; i++) { const v = Math.abs(d[i]); peak = Math.max(peak, v); if (v > 0.83) over++; sq += v * v; n++; } }
+          const cents = [], flux = [];
+          let prev = null;
+          for (const f of fr) {
+            let num = 0, den = 0;
+            for (let k = 1; k < f.mag.length; k++) { num += f.mag[k] * (k * sr) / N; den += f.mag[k]; }
+            f.centroid = den > 0 ? num / den : 0;
+            if (f.rms > 0.003) cents.push(f.centroid);
+            let fl = 0;
+            if (prev) for (let k = 1; k < f.mag.length; k++) fl += Math.max(0, Math.log1p(f.mag[k] * 10) - Math.log1p(prev.mag[k] * 10));
+            flux.push(fl);
+            prev = f;
+          }
+          // onsets: spectral-flux peaks above an adaptive threshold
+          const onsets = [];
+          for (let i = 1; i < flux.length - 1; i++) {
+            const lo = Math.max(0, i - 8), hi = Math.min(flux.length, i + 9);
+            const loc = flux.slice(lo, hi).sort((a, z) => a - z);
+            const med = loc[loc.length >> 1];
+            if (flux[i] > flux[i - 1] && flux[i] >= flux[i + 1] && flux[i] > med * 1.6 + 2 && (!onsets.length || fr[i].t - onsets[onsets.length - 1] > 0.06)) onsets.push(fr[i].t);
+          }
+          const mean = (a) => a.reduce((x, y) => x + y, 0) / Math.max(1, a.length);
+          const cm = mean(cents);
+          return { seconds: b.duration, peak, overPct: (over / n) * 100, rms: Math.sqrt(sq / n), centroid: cm, centroidStd: Math.sqrt(mean(cents.map((c) => (c - cm) ** 2))), onsets, silentFrac: fr.filter((f) => f.rms < 0.0015).length / Math.max(1, fr.length), frames: fr.map((f) => [f.t, f.rms, f.centroid]) };
+        },
+        clicks(b) {
+          let clicks = 0, worst = 0;
+          const at = [];
+          const W = 256;
+          for (let c = 0; c < b.numberOfChannels; c++) {
+            const d = b.getChannelData(c);
+            const dd = new Float32Array(d.length);
+            for (let i = 2; i < d.length; i++) dd[i] = Math.abs(d[i] - 2 * d[i - 1] + d[i - 2]);
+            let acc = 0;
+            for (let i = 0; i < Math.min(W, dd.length); i++) acc += dd[i];
+            // a click is an ISOLATED event: well above the local level AND ≥ 4× every spike 0.7 ms–6 ms
+            // away. Periodic edges of a bright waveform (a sawtooth through an open filter) recur every
+            // cycle, so they have rivals in that range; a discontinuity (one burst) does not.
+            for (let i = W; i < dd.length - W; i++) {
+              acc += dd[i + W] - dd[i - W];
+              const local = acc / (2 * W);
+              worst = Math.max(worst, dd[i] / Math.max(1e-4, local));
+              if (!(dd[i] > 0.02 && dd[i] > local * 12)) continue;
+              let rival = 0;
+              for (let j = i - W; j <= i + W; j++) if (Math.abs(j - i) > 32) rival = Math.max(rival, dd[j]);
+              if (dd[i] < rival * 4) continue;
+              clicks++;
+              if (at.length < 8) at.push(+(i / b.sampleRate).toFixed(3));
+            }
+          }
+          return { clicks, worst, at };
+        },
+        spectrogram(b, W = 1200, H = 360) {
+          const fr = stft(b, 2048, Math.max(256, Math.floor((b.length - 2048) / W)));
+          const c = document.createElement('canvas'); c.width = W; c.height = H;
+          const g = c.getContext('2d'); const img = g.createImageData(W, H);
+          const sr = b.sampleRate;
+          for (let x = 0; x < W; x++) {
+            const f = fr[Math.min(fr.length - 1, Math.floor((x / W) * fr.length))];
+            for (let y = 0; y < H; y++) {
+              const hz = 40 * Math.pow(16000 / 40, 1 - y / (H - 1));
+              const k = Math.min(f.mag.length - 1, Math.round((hz * 2048) / sr));
+              const db = 20 * Math.log10(f.mag[k] + 1e-9);
+              const v = Math.max(0, Math.min(1, (db + 40) / 70));
+              const j = (y * W + x) * 4;
+              img.data[j] = 255 * Math.min(1, v * 1.6); img.data[j + 1] = 255 * Math.max(0, v * 1.5 - 0.4); img.data[j + 2] = 255 * Math.max(0, 0.5 - Math.abs(v - 0.4)) * 1.4; img.data[j + 3] = 255;
+            }
+          }
+          g.putImageData(img, 0, 0);
+          return c.toDataURL('image/png');
+        },
+      };
+    });
+  const render = (o) => S(async (o) => {
+    const { api, store } = window.__aperture;
+    let p = store.getState().project;
+    // dry: no inserts, sends or echo lanes — for measuring where notes start, not their tails
+    if (o.dry) p = { ...p, tracks: p.tracks.map((t) => ({ ...t, fx: [], mix: { ...t.mix, reverb: 0, delay: 0 }, automation: t.automation.filter((a) => !['reverbSend', 'delaySend', 'delayFeedback'].includes(a.target)) })) };
+    const only = o.only ? p.tracks.filter((t) => o.only.some((k) => t.generator === k || t.generator?.startsWith(k))).map((t) => t.id) : undefined;
+    const to = o.to ?? p.settings.lengthBars * 4;
+    const b = await api.renderOffline(p, { from: 0, to, tail: o.tail ?? 3, sampleRate: 44100, only });
+    const f = window.__audio.features(b);
+    let tonal = null;
+    if (o.audit) {
+      const ids = p.tracks.filter((t) => (!only || only.includes(t.id)) && t.notes.length && !['drums', 'glitch', 'noise'].includes(t.patch.engine)).map((t) => t.id);
+      if (ids.length) tonal = window.__audio.clicks(await api.renderOffline(p, { from: 0, to, tail: 1, sampleRate: 44100, only: ids }));
+      // which layer clicks, and when (seconds) — so a defect can be traced to a voice
+      if (tonal?.clicks) tonal.byTrack = await Promise.all(ids.map(async (id) => { const t = p.tracks.find((x) => x.id === id); const c = window.__audio.clicks(await api.renderOffline(p, { from: 0, to, tail: 1, sampleRate: 44100, only: [id] })); return `${t.name}/${t.patch.name}: ${c.clicks} @ ${c.at.join(',')}`; }));
+    }
+    let wav = null, png = null;
+    if (o.save) {
+      const bytes = new Uint8Array(api.encodeWav([b.getChannelData(0), b.getChannelData(1)], b.sampleRate, 16));
+      let str = ''; const CH = 0x8000;
+      for (let i = 0; i < bytes.length; i += CH) str += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+      wav = btoa(str);
+      png = window.__audio.spectrogram(b);
+    }
+    return { f, tonal, wav, png, bpm: p.settings.bpm };
+  }, o);
   const rmsOver = async (ms) => { let m = 0; const t0 = Date.now(); while (Date.now() - t0 < ms) { m = Math.max(m, await S(() => window.__aperture.liveRms())); await sleep(80); } return m; };
   const stop = async () => { await S(() => { window.__aperture.engine.stop(); window.__aperture.engine.stop(); }); await sleep(300); };
   const download = async (clickSel) => { const [d] = await Promise.all([page.waitForEvent('download', { timeout: 120000 }), page.click(clickSel)]); const p = await d.path(); return { name: d.suggestedFilename(), bytes: readFileSync(p) }; };
@@ -506,95 +635,7 @@ try {
   if (want('sonify')) {
     const LDIR = `${OUT}listening/`;
     mkdirSync(LDIR, { recursive: true });
-    // page-side audio analysis: STFT features, spectral-flux onsets, click audit, spectrogram
-    await S(() => {
-      const fft = (re, im) => {
-        const n = re.length;
-        for (let i = 1, j = 0; i < n; i++) { let bit = n >> 1; for (; j & bit; bit >>= 1) j ^= bit; j ^= bit; if (i < j) { [re[i], re[j]] = [re[j], re[i]]; [im[i], im[j]] = [im[j], im[i]]; } }
-        for (let len = 2; len <= n; len <<= 1) {
-          const ang = (-2 * Math.PI) / len, wr = Math.cos(ang), wi = Math.sin(ang);
-          for (let i = 0; i < n; i += len) { let cr = 1, ci = 0; for (let k = 0; k < len / 2; k++) { const ar = re[i + k], ai = im[i + k], br = re[i + k + len / 2] * cr - im[i + k + len / 2] * ci, bi = re[i + k + len / 2] * ci + im[i + k + len / 2] * cr; re[i + k] = ar + br; im[i + k] = ai + bi; re[i + k + len / 2] = ar - br; im[i + k + len / 2] = ai - bi; const t = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = t; } }
-        }
-      };
-      const mono = (b) => { const a = b.getChannelData(0), c = b.numberOfChannels > 1 ? b.getChannelData(1) : a; const m = new Float32Array(a.length); for (let i = 0; i < a.length; i++) m[i] = (a[i] + c[i]) / 2; return m; };
-      const stft = (b, N = 2048, H = 1024) => {
-        const x = mono(b), win = new Float32Array(N).map((_, i) => 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / N));
-        const frames = [];
-        for (let s0 = 0; s0 + N <= x.length; s0 += H) {
-          const re = new Float32Array(N), im = new Float32Array(N);
-          let e = 0;
-          for (let i = 0; i < N; i++) { re[i] = x[s0 + i] * win[i]; e += x[s0 + i] ** 2; }
-          fft(re, im);
-          const mag = new Float32Array(N / 2);
-          for (let k = 0; k < N / 2; k++) mag[k] = Math.hypot(re[k], im[k]);
-          frames.push({ t: (s0 + N / 2) / b.sampleRate, rms: Math.sqrt(e / N), mag });
-        }
-        return frames;
-      };
-      window.__audio = {
-        features(b) {
-          const fr = stft(b);
-          const sr = b.sampleRate, N = 2048;
-          let peak = 0, over = 0, n = 0, sq = 0;
-          for (let c = 0; c < b.numberOfChannels; c++) { const d = b.getChannelData(c); for (let i = 0; i < d.length; i++) { const v = Math.abs(d[i]); peak = Math.max(peak, v); if (v > 0.83) over++; sq += v * v; n++; } }
-          const cents = [], flux = [];
-          let prev = null;
-          for (const f of fr) {
-            let num = 0, den = 0;
-            for (let k = 1; k < f.mag.length; k++) { num += f.mag[k] * (k * sr) / N; den += f.mag[k]; }
-            f.centroid = den > 0 ? num / den : 0;
-            if (f.rms > 0.003) cents.push(f.centroid);
-            let fl = 0;
-            if (prev) for (let k = 1; k < f.mag.length; k++) fl += Math.max(0, Math.log1p(f.mag[k] * 10) - Math.log1p(prev.mag[k] * 10));
-            flux.push(fl);
-            prev = f;
-          }
-          // onsets: spectral-flux peaks above an adaptive threshold
-          const onsets = [];
-          for (let i = 1; i < flux.length - 1; i++) {
-            const lo = Math.max(0, i - 8), hi = Math.min(flux.length, i + 9);
-            const loc = flux.slice(lo, hi).sort((a, z) => a - z);
-            const med = loc[loc.length >> 1];
-            if (flux[i] > flux[i - 1] && flux[i] >= flux[i + 1] && flux[i] > med * 1.6 + 2 && (!onsets.length || fr[i].t - onsets[onsets.length - 1] > 0.06)) onsets.push(fr[i].t);
-          }
-          const mean = (a) => a.reduce((x, y) => x + y, 0) / Math.max(1, a.length);
-          const cm = mean(cents);
-          return { seconds: b.duration, peak, overPct: (over / n) * 100, rms: Math.sqrt(sq / n), centroid: cm, centroidStd: Math.sqrt(mean(cents.map((c) => (c - cm) ** 2))), onsets, silentFrac: fr.filter((f) => f.rms < 0.0015).length / Math.max(1, fr.length), frames: fr.map((f) => [f.t, f.rms, f.centroid]) };
-        },
-        clicks(b) {
-          let clicks = 0, worst = 0;
-          const W = 256;
-          for (let c = 0; c < b.numberOfChannels; c++) {
-            const d = b.getChannelData(c);
-            const dd = new Float32Array(d.length);
-            for (let i = 2; i < d.length; i++) dd[i] = Math.abs(d[i] - 2 * d[i - 1] + d[i - 2]);
-            let acc = 0;
-            for (let i = 0; i < Math.min(W, dd.length); i++) acc += dd[i];
-            for (let i = W; i < dd.length - W; i++) { acc += dd[i + W] - dd[i - W]; const local = acc / (2 * W); worst = Math.max(worst, dd[i] / Math.max(1e-4, local)); if (dd[i] > 0.02 && dd[i] > local * 12) clicks++; }
-          }
-          return { clicks, worst };
-        },
-        spectrogram(b, W = 1200, H = 360) {
-          const fr = stft(b, 2048, Math.max(256, Math.floor((b.length - 2048) / W)));
-          const c = document.createElement('canvas'); c.width = W; c.height = H;
-          const g = c.getContext('2d'); const img = g.createImageData(W, H);
-          const sr = b.sampleRate;
-          for (let x = 0; x < W; x++) {
-            const f = fr[Math.min(fr.length - 1, Math.floor((x / W) * fr.length))];
-            for (let y = 0; y < H; y++) {
-              const hz = 40 * Math.pow(16000 / 40, 1 - y / (H - 1));
-              const k = Math.min(f.mag.length - 1, Math.round((hz * 2048) / sr));
-              const db = 20 * Math.log10(f.mag[k] + 1e-9);
-              const v = Math.max(0, Math.min(1, (db + 40) / 70));
-              const j = (y * W + x) * 4;
-              img.data[j] = 255 * Math.min(1, v * 1.6); img.data[j + 1] = 255 * Math.max(0, v * 1.5 - 0.4); img.data[j + 2] = 255 * Math.max(0, 0.5 - Math.abs(v - 0.4)) * 1.4; img.data[j + 3] = 255;
-            }
-          }
-          g.putImageData(img, 0, 0);
-          return c.toDataURL('image/png');
-        },
-      };
-    });
+    await installAudio();
     const loadSource = (o) => S(async (o) => {
       const { api, store } = window.__aperture;
       const s = store.getState();
@@ -605,30 +646,6 @@ try {
       await store.getState().importImage(blob, `${o.fn}.png`, o.kind, o.settings);
       const p = store.getState().project;
       return p.tracks.filter((t) => t.generator?.startsWith(o.kind === 'image' ? 'image:' : 'pano:')).map((t) => ({ id: t.id, key: t.generator, name: t.name, notes: t.notes.length, engine: t.patch.engine }));
-    }, o);
-    const render = (o) => S(async (o) => {
-      const { api, store } = window.__aperture;
-      let p = store.getState().project;
-      // dry: no inserts, sends or echo lanes — for measuring where notes start, not their tails
-      if (o.dry) p = { ...p, tracks: p.tracks.map((t) => ({ ...t, fx: [], mix: { ...t.mix, reverb: 0, delay: 0 }, automation: t.automation.filter((a) => !['reverbSend', 'delaySend', 'delayFeedback'].includes(a.target)) })) };
-      const only = o.only ? p.tracks.filter((t) => o.only.some((k) => t.generator === k || t.generator?.startsWith(k))).map((t) => t.id) : undefined;
-      const to = o.to ?? p.settings.lengthBars * 4;
-      const b = await api.renderOffline(p, { from: 0, to, tail: o.tail ?? 3, sampleRate: 44100, only });
-      const f = window.__audio.features(b);
-      let tonal = null;
-      if (o.audit) {
-        const ids = p.tracks.filter((t) => (!only || only.includes(t.id)) && t.notes.length && !['drums', 'glitch', 'noise'].includes(t.patch.engine)).map((t) => t.id);
-        if (ids.length) tonal = window.__audio.clicks(await api.renderOffline(p, { from: 0, to, tail: 1, sampleRate: 44100, only: ids }));
-      }
-      let wav = null, png = null;
-      if (o.save) {
-        const bytes = new Uint8Array(api.encodeWav([b.getChannelData(0), b.getChannelData(1)], b.sampleRate, 16));
-        let str = ''; const CH = 0x8000;
-        for (let i = 0; i < bytes.length; i += CH) str += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
-        wav = btoa(str);
-        png = window.__audio.spectrogram(b);
-      }
-      return { f, tonal, wav, png, bpm: p.settings.bpm };
     }, o);
     const dB = (x) => (20 * Math.log10(Math.max(1e-9, x))).toFixed(1);
     const fs = await import('node:fs');
@@ -704,6 +721,272 @@ try {
     }
     const pressed = await page.getAttribute('button[data-view="overlay"]', 'aria-pressed');
     check('image views: photograph / extracted contours / overlay are selectable', pressed === 'true');
+  }
+
+  // ------------------------------------------------------------------ musical intelligence (brief Phases 2–10)
+  if (want('musical')) {
+    await installAudio();
+    const fs = await import('node:fs');
+    const MDIR = `${OUT}listening/musical/`;
+    mkdirSync(MDIR, { recursive: true });
+    const st = (fn, arg) => S(fn, arg);
+    const pcOf = (m) => ((Math.round(m) % 12) + 12) % 12;
+
+    // the click audit itself: it must catch a real discontinuity and pass a bright periodic waveform
+    const audit = await st(async () => {
+      const sr = 44100, n = sr;
+      const make = async (fill) => { const c = new OfflineAudioContext(1, n, sr); const b = c.createBuffer(1, n, sr); fill(b.getChannelData(0), c); return b; };
+      const sine = await make((d) => { for (let i = 0; i < n; i++) d[i] = 0.3 * Math.sin((2 * Math.PI * 220 * i) / sr); });
+      const glitch = await make((d) => { for (let i = 0; i < n; i++) d[i] = 0.3 * Math.sin((2 * Math.PI * 220 * i) / sr) + (i >= 22050 && i < 22060 ? 0.25 : 0); });
+      const c = new OfflineAudioContext(1, n, sr);
+      const o = c.createOscillator(); o.type = 'sawtooth'; o.frequency.value = 880;
+      const f = c.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = 9000; f.Q.value = 3;
+      const g = c.createGain(); g.gain.value = 0.3;
+      o.connect(f).connect(g).connect(c.destination); o.start();
+      const saw = await c.startRendering();
+      return { sine: window.__audio.clicks(sine).clicks, glitch: window.__audio.clicks(glitch).clicks, saw: window.__audio.clicks(saw).clicks };
+    });
+    check('click audit: flags an injected discontinuity, passes a clean sine and a bright 880 Hz sawtooth', audit.glitch > 0 && audit.sine === 0 && audit.saw === 0, JSON.stringify(audit));
+
+    // DEMOS=name,name runs only those listening demos (for investigating one render)
+    if (!process.env.DEMOS) {
+    // 1. the Harmony tab drives the shared context
+    await st(() => { const s = window.__aperture.store.getState(); s.newProject(); s.setWorkspace('generative'); s.setUi({ inspectorTab: 'harmony', rightOpen: true }); });
+    await sleep(300);
+    await page.selectOption('select[aria-label="Harmony key"]', '2');
+    await page.selectOption('select[aria-label="Harmony scale"]', 'dorian');
+    await sleep(150);
+    const tones = (await page.locator('.scale-tones span').allTextContents()).join(' ');
+    const toolbarScale = await page.inputValue('select[aria-label="Scale"]');
+    check('harmony tab: key/scale are the project’s (toolbar follows), tones listed', tones === 'D E F G A B C' && toolbarScale === 'dorian', `${tones} · toolbar ${toolbarScale}`);
+    await page.fill('#harm-seq', 'i IV i bVII');
+    await page.click('#harm-seq + button');
+    await sleep(200);
+    const seq = await st(() => { const p = window.__aperture.store.getState().project; return { roots: p.harmony.slots.slice(0, 4).map((x) => x.chord.rootPc), author: p.harmony.author, prog: p.harmony.progression, chips: document.querySelectorAll('.chips .chip').length }; });
+    check('typed Roman-numeral progression becomes the shared timeline', seq.roots.join() === '2,7,2,0' && seq.author === 'harmony' && seq.prog === 'custom' && seq.chips > 3, JSON.stringify(seq));
+    const strip = await page.textContent('.music-strip');
+    check('the live strip shows key, scale and current chord', /D Dorian/.test(strip) && /Dm/.test(strip), strip);
+    await page.click('.insp-body .seg button:has-text("Expressive")');
+    await sleep(150);
+    check('behaviour control sets Expressive', (await st(() => window.__aperture.store.getState().project.harmony.behavior)) === 'expressive');
+    await page.screenshot({ path: `${OUT}musical-harmony-tab.png` });
+
+    // 2. generative composition follows it; "regenerate harmony only" keeps the rhythmic identity
+    const gen1 = await st(() => {
+      const s = window.__aperture.store.getState();
+      s.setHarmony({ behavior: 'strict', sequence: '', progression: 'auto' });
+      s.setComposition({ style: 'cinematic', seed: 5, bars: 16, percussion: false });
+      window.__aperture.store.getState().generateComposition(undefined, false);
+      const p = window.__aperture.store.getState().project;
+      const gen = p.tracks.filter((t) => t.generator?.startsWith('gen:'));
+      const pcs = window.__aperture.api.projectContext(p).pcs;
+      return { drums: gen.some((t) => t.role === 'percussion'), out: gen.flatMap((t) => t.notes).filter((n) => !pcs.includes(((n.midi % 12) + 12) % 12)).length, n: gen.flatMap((t) => t.notes).length, author: p.harmony.author, slots: p.harmony.slots.map((x) => x.chord.pcs.join('.')).join(' '), mel: gen.find((t) => t.generator === 'gen:melody')?.notes.map((n) => n.start.toFixed(2)) ?? [] };
+    });
+    check('generated piece: no percussion when off, Strict keeps every note in D Dorian, harmony published', !gen1.drums && gen1.out === 0 && gen1.n > 100 && gen1.author === 'generative', `${gen1.n} notes, ${gen1.out} outside`);
+    await page.click('button:has-text("Regenerate harmony only")');
+    await sleep(300);
+    const gen2 = await st(() => { const p = window.__aperture.store.getState().project; return { slots: p.harmony.slots.map((x) => x.chord.pcs.join('.')).join(' '), mel: p.tracks.find((t) => t.generator === 'gen:melody')?.notes.map((n) => n.start.toFixed(2)) ?? [] }; });
+    const same = gen1.mel.filter((x) => gen2.mel.includes(x)).length / Math.max(gen1.mel.length, gen2.mel.length);
+    check('regenerate harmony only: new chords, the melody keeps its rhythm', gen2.slots !== gen1.slots && same > 0.8, `onset overlap ${(same * 100).toFixed(0)}%`);
+
+    // 3. Orbital voices and Particle zones through the UI, sharing the harmony
+    await st(() => { const s = window.__aperture.store.getState(); s.setUi({ inspectorTab: 'source' }); s.setWorkspace('orbital'); });
+    await sleep(300);
+    await page.click('button:has-text("+ Voice")');
+    await sleep(200);
+    const ob = await page.locator('.stage canvas').boundingBox();
+    const cx = ob.x + ob.width / 2, cy = ob.y + ob.height / 2, R = Math.min(ob.width, ob.height) / 2 - 28;
+    await page.mouse.move(cx + R * 0.3, cy - R * 0.5); await page.mouse.down();
+    for (let i = 0; i <= 24; i++) { const a = -Math.PI / 2 + (i / 24) * Math.PI * 1.6; await page.mouse.move(cx + Math.cos(a) * R * (0.35 + 0.25 * Math.sin(i / 3)), cy + Math.sin(a) * R * (0.35 + 0.25 * Math.sin(i / 3))); }
+    await page.mouse.up();
+    await sleep(250);
+    await page.click('[role=group][aria-label="Pitch"] button:has-text("Chord")');
+    await sleep(250);
+    const orb = await st(() => {
+      const { store, api } = window.__aperture; const p = store.getState().project; const ctx = api.projectContext(p);
+      const v = p.orbital.voices.find((x) => x.id === p.orbital.active);
+      const notes = p.tracks.flatMap((t) => t.notes).filter((n) => n.origin === 'orbital' && n.id.startsWith(`${v.id}_`));
+      return { voices: p.orbital.voices.length, n: notes.length, chordTones: notes.filter((n) => api.slotAt(ctx, n.start).chord.pcs.includes(((n.midi % 12) + 12) % 12)).length, end: Math.max(...notes.map((n) => n.start)), pitch: v.pitch };
+    });
+    check('a second orbital voice draws, repeats through the piece and (Chord pitch) plays only chord tones', orb.voices === 2 && orb.n > 4 && orb.chordTones === orb.n && orb.end > 16 && orb.pitch === 'chord', JSON.stringify(orb));
+    await page.screenshot({ path: `${OUT}musical-orbital.png` });
+    await st(() => window.__aperture.store.getState().setWorkspace('particles'));
+    await sleep(300);
+    const pb = await page.locator('.stage canvas').boundingBox();
+    await page.mouse.move(pb.x + pb.width * 0.25, pb.y + pb.height * 0.4); await page.mouse.down();
+    await page.mouse.move(pb.x + pb.width * 0.75, pb.y + pb.height * 0.95, { steps: 6 }); await page.mouse.up();
+    await sleep(300);
+    await page.selectOption('select[aria-label="Behaviour"] >> nth=0', 'arp');
+    await sleep(250);
+    const part = await st(() => {
+      const { store, api } = window.__aperture; const p = store.getState().project; const ctx = api.projectContext(p);
+      const notes = p.tracks.flatMap((t) => t.notes).filter((n) => n.origin === 'particle');
+      return { n: notes.length, behaviour: p.particles.zones[0]?.behavior, chordTones: notes.filter((n) => api.slotAt(ctx, n.start).chord.pcs.includes(((n.midi % 12) + 12) % 12)).length, orbital: p.tracks.flatMap((t) => t.notes).filter((n) => n.origin === 'orbital').length };
+    });
+    check('a particle zone set to Arpeggio plays chord tones; orbital notes are untouched', part.n > 3 && part.behaviour === 'arp' && part.chordTones === part.n && part.orbital >= orb.n, JSON.stringify(part));
+    await page.screenshot({ path: `${OUT}musical-particles.png` });
+    await st(() => window.__aperture.engine.play(0));
+    const live = await rmsOver(1800);
+    await stop();
+    check('orbital + particles + composition play together (live RMS)', live > 0.01, `RMS ${live.toFixed(4)}`);
+
+    // 4. removing, replacing and clearing image / panorama sources
+    const png = async (fn, args) => Buffer.from(await st(async ({ fn, args }) => { const { api } = window.__aperture; const r = api[fn](...args); const b = await api.rgbaToPng(r.img ?? r); const u = new Uint8Array(await b.arrayBuffer()); let s = ''; for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000)); return btoa(s); }, { fn, args }), 'base64');
+    const waitSource = (kind) => page.waitForFunction((kind) => { const s = window.__aperture.store.getState(); return s.project[kind] && s.ui.analysis[kind].status === 'done' && s.project.tracks.some((t) => t.generator?.startsWith(kind === 'image' ? 'image:' : 'pano:')); }, kind, { timeout: 90000 }).catch(async (e) => { console.log('waitSource', kind, JSON.stringify(await S((kind) => { const s = window.__aperture.store.getState(); return { has: !!s.project[kind], job: s.ui.analysis[kind], gens: s.project.tracks.map((t) => t.generator) }; }, kind))); throw e; });
+    await st(async () => {
+      const { store, api } = window.__aperture; const s = store.getState();
+      s.newProject(); s.setSettings({ key: 9, scale: 'minor' });
+      s.addStroke({ trackId: store.getState().project.tracks[0].id, shape: 'line', brush: { ...store.getState().ui.brush, kind: 'legato' }, points: [{ x: 0, y: 0.3 }, { x: 6, y: 0.7 }] });
+      const img = (r) => api.rgbaToPng(r.img ?? r);
+      await store.getState().importImage(await img(api.ridgesImage(560, 320)), 'ridges.png', 'image');
+      await store.getState().importImage(await img(api.panoramaLandscape(1800, 300)), 'land.png', 'panorama', { timing: 'beat', bars: 8 });
+    });
+    await waitSource('image'); await waitSource('panorama');
+    const before = await st(() => { const p = window.__aperture.store.getState().project; return { img: p.image.asset.assetId, pano: p.panorama.asset.assetId, strokes: p.strokes.length, drawn: p.tracks[0].notes.filter((n) => n.origin === 'drawn').length, imgTracks: p.tracks.filter((t) => t.generator?.startsWith('image:')).length, panoTracks: p.tracks.filter((t) => t.generator?.startsWith('pano:')).map((t) => t.id) }; });
+    await st(() => window.__aperture.store.getState().setWorkspace('image'));
+    await sleep(300);
+    await page.screenshot({ path: `${OUT}musical-image-source-bar.png` });
+    await page.click('.source-bar button:has-text("Remove image")');
+    await page.click('.modal button:has-text("Remove the image and its layers")');
+    await sleep(300);
+    const after = await st((b) => { const { store, api } = window.__aperture; const p = store.getState().project; return { image: !!p.image, pano: p.panorama?.asset.assetId, imgTracks: p.tracks.filter((t) => t.generator?.startsWith('image:')).length, panoTracks: p.tracks.filter((t) => t.generator?.startsWith('pano:')).map((t) => t.id), strokes: p.strokes.length, drawn: p.tracks[0].notes.filter((n) => n.origin === 'drawn').length, cache: !!api.getAnalysis(b.img) || !!api.getLevels(b.img), empty: !!document.querySelector('.overlay-msg h2')?.textContent?.includes('photograph') }; }, before);
+    check('remove image: picture, its layers and its caches gone; panorama, drawing and other tracks intact; empty state shown', !after.image && after.imgTracks === 0 && after.pano === before.pano && after.panoTracks.join() === before.panoTracks.join() && after.strokes === before.strokes && after.drawn === before.drawn && !after.cache && after.empty, JSON.stringify(after));
+    await page.screenshot({ path: `${OUT}musical-image-removed.png` });
+    await st(() => window.__aperture.store.getState().undo());
+    await page.waitForFunction((id) => !!window.__aperture.api.getAnalysis(id), before.img, { timeout: 60000 });
+    const undone = await st(() => { const p = window.__aperture.store.getState().project; return { image: p.image?.asset.assetId, imgTracks: p.tracks.filter((t) => t.generator?.startsWith('image:')).length }; });
+    check('undo restores the image and re-analyses it from storage', undone.image === before.img && undone.imgTracks === before.imgTracks, JSON.stringify(undone));
+    await st(() => window.__aperture.store.getState().redo());
+    await sleep(200);
+    // keep-music removal of the panorama
+    await st(() => window.__aperture.store.getState().setWorkspace('panorama'));
+    await sleep(300);
+    const panoNotes = await st(() => window.__aperture.store.getState().project.tracks.filter((t) => t.generator?.startsWith('pano:')).reduce((n, t) => n + t.notes.length, 0));
+    await page.click('.source-bar button:has-text("Remove panorama")');
+    await page.click('.modal button:has-text("keep its music")');
+    await sleep(300);
+    const kept = await st((ids) => { const p = window.__aperture.store.getState().project; const ts = p.tracks.filter((t) => ids.includes(t.id)); return { pano: !!p.panorama, n: ts.length, notes: ts.reduce((n, t) => n + t.notes.length, 0), detached: ts.every((t) => !t.generator), user: ts.every((t) => t.notes.every((n) => n.origin !== 'panorama')) }; }, before.panoTracks);
+    check('remove panorama, keep its music: layers stay as detached, editable tracks', !kept.pano && kept.n === before.panoTracks.length && kept.notes === panoNotes && kept.detached && kept.user, JSON.stringify(kept));
+    // save → reload → the removal persists
+    await st(() => window.__aperture.store.getState().saveNow());
+    await page.reload();
+    await page.waitForFunction(() => window.__aperture?.store?.getState().project.strokes.length === 1, null, { timeout: 20000 });
+    const reopened = await st(() => { const p = window.__aperture.store.getState().project; return { image: !!p.image, pano: !!p.panorama, tracks: p.tracks.length, json: JSON.stringify(p) }; });
+    check('save and reopen: no image or panorama, no reference to the removed files, music kept', !reopened.image && !reopened.pano && !reopened.json.includes(before.img) && !reopened.json.includes(before.pano) && reopened.tracks >= 4 + before.panoTracks.length, `${reopened.tracks} tracks`);
+    await page.mouse.click(700, 400);
+    await page.waitForFunction(() => window.__aperture.engine.ready, null, { timeout: 10000 });
+    // replace: a new image in place of the old one; old notes and analysis never carry over
+    await st(async () => { const { store, api } = window.__aperture; const r = api.ridgesImage(560, 320); await store.getState().importImage(await api.rgbaToPng(r.img ?? r), 'first.png', 'image'); });
+    await waitSource('image');
+    await st(() => window.__aperture.store.getState().setWorkspace('image'));
+    const old = await st(() => { const s = window.__aperture.store.getState(); const t = s.project.tracks.find((x) => x.generator?.startsWith('image:') && x.notes.length); s.addNote(t.id, { start: 1, dur: 1, midi: 69, vel: 0.7 }); return { id: s.project.image.asset.assetId, track: t.id }; });
+    await page.locator('input[aria-label="Replace image file"]').first().setInputFiles({ name: 'second.png', mimeType: 'image/png', buffer: await png('colorfulTexture', [400, 280]) });
+    await page.waitForFunction((id) => { const s = window.__aperture.store.getState(); return s.project.image && s.project.image.asset.assetId !== id && s.ui.analysis.image.status === 'done'; }, old.id, { timeout: 90000 });
+    await sleep(300);
+    const rep = await st((old) => { const { store, api } = window.__aperture; const p = store.getState().project; const t = p.tracks.find((x) => x.id === old.track); return { name: p.image.asset.name, oldCache: !!api.getAnalysis(old.id), userKept: !!t && !t.generator && t.notes.some((n) => n.origin === 'user'), staleOnNew: p.tracks.filter((x) => x.generator?.startsWith('image:')).some((x) => x.notes.some((n) => n.origin === 'user')), newNotes: p.tracks.filter((x) => x.generator?.startsWith('image:')).reduce((n, x) => n + x.notes.length, 0) }; }, old);
+    check('replace image: the new picture is analysed; the old analysis is dropped; edited notes stay on a detached layer, never on the new layers', rep.name === 'second.png' && !rep.oldCache && rep.userKept && !rep.staleOnNew && rep.newNotes > 0, JSON.stringify(rep));
+    await page.click('.source-bar button:has-text("Clear generated notes")');
+    await sleep(200);
+    const cleared = await st(() => { const p = window.__aperture.store.getState().project; return { image: !!p.image, notes: p.tracks.filter((x) => x.generator?.startsWith('image:')).reduce((n, x) => n + x.notes.filter((m) => m.origin === 'image').length, 0) }; });
+    await st(() => window.__aperture.store.getState().generateImage());
+    await sleep(300);
+    const regen = await st(() => window.__aperture.store.getState().project.tracks.filter((x) => x.generator?.startsWith('image:')).reduce((n, x) => n + x.notes.length, 0));
+    check('clear generated notes keeps the picture; Generate reads it again', cleared.image && cleared.notes === 0 && regen > 0, `${regen} notes after regenerating`);
+    // portable export carries only the current picture; unreferenced blobs are collected
+    const proj = await st(async () => { const { store } = window.__aperture; return { id: store.getState().project.image.asset.assetId }; });
+    await st(() => window.__aperture.store.getState().setUi({ dialog: 'export' }));
+    const pf = await download('button:has-text("Project file")');
+    const zip = unzipSync(new Uint8Array(pf.bytes));
+    const manifest = JSON.parse(new TextDecoder().decode(zip['manifest.json']));
+    check('portable project file packages only the current picture', manifest.assets.length === 1 && manifest.assets[0].id === proj.id && !new TextDecoder().decode(zip['project.json']).includes(old.id), manifest.assets.map((a) => a.id).join());
+    await page.keyboard.press('Escape');
+    await st(() => { const st = window.__aperture.store; st.setState({ past: [], future: [] }); return st.getState().saveNow(); });
+    await sleep(800);
+    const ids = await st(() => window.__aperture.api.listAssetIds());
+    check('stored image blobs: the replaced and removed files are collected, the current one is kept', ids.includes(proj.id) && !ids.includes(old.id) && !ids.includes(before.img) && !ids.includes(before.pano), `${ids.length} blobs`);
+    await page.keyboard.press('Escape');
+
+    }
+    // 5. listening demos: render, measure, save WAV + spectrogram + note-level report
+    await installAudio(); // the reload above cleared the page-side tools
+    const demos = [
+      { name: 'A-c-major-C-Am-F-G', ps: { bpm: 92, key: 0, scale: 'major' }, h: { behavior: 'strict', progression: 'custom', sequence: 'C Am F G', rhythm: 1 }, c: { style: 'cinematic', seed: 4, bars: 16, percussion: false } },
+      { name: 'B-d-dorian-dub', ps: { bpm: 76, key: 2, scale: 'dorian' }, h: { behavior: 'expressive' }, c: { style: 'ambientDub', seed: 3, bars: 16, percussion: true } },
+      { name: 'C-a-minor-pentatonic-minimal', ps: { bpm: 118, key: 9, scale: 'minorPent' }, h: { behavior: 'strict' }, c: { style: 'minimal', seed: 2, bars: 16, percussion: true } },
+      { name: 'D-f-minor-blues', ps: { bpm: 84, key: 5, scale: 'minorBlues' }, h: { behavior: 'expressive', progression: 'diatonic', rhythm: 1 }, c: { style: 'ambientDub', seed: 6, bars: 12, percussion: true } },
+      { name: 'E-idm-e-minor-strict', ps: { bpm: 104, key: 4, scale: 'minor' }, h: { behavior: 'strict' }, c: { style: 'idm', seed: 2, bars: 16, percussion: true, irregularity: 0.7 } },
+      { name: 'E2-idm-e-minor-experimental', ps: { bpm: 104, key: 4, scale: 'minor' }, h: { behavior: 'experimental' }, c: { style: 'idm', seed: 2, bars: 16, percussion: true, irregularity: 0.7, tension: 0.8 } },
+      { name: 'G-free-time-ambient', ps: { bpm: 66, key: 9, scale: 'minor' }, h: { behavior: 'strict' }, c: { style: 'ambient', seed: 3, bars: 16, time: 'free' } },
+      { name: 'H-cinematic-5-4', ps: { bpm: 96, key: 7, scale: 'mixolydian', timeSig: '5/4' }, h: { behavior: 'expressive' }, c: { style: 'cinematic', seed: 8, bars: 12, percussion: true } },
+      { name: 'H2-motorik-7-8', ps: { bpm: 132, key: 2, scale: 'dorian', timeSig: '7/8' }, h: { behavior: 'strict' }, c: { style: 'motorik', seed: 5, bars: 16, percussion: true } },
+      { name: 'F-orbital-particles-d-dorian', ps: { bpm: 76, key: 2, scale: 'dorian', lengthBars: 16 }, h: { behavior: 'strict', progression: 'modal', rhythm: 2 }, eco: true },
+    ];
+    const report = [];
+    const summary = [];
+    for (const d of demos.filter((x) => !process.env.DEMOS || process.env.DEMOS.split(',').some((k) => x.name.startsWith(k)))) {
+      await st(async (d) => {
+        const { store } = window.__aperture; const s = store.getState();
+        s.newProject();
+        store.getState().setSettings({ ...d.ps });
+        store.getState().setHarmony({ progression: 'auto', sequence: '', rhythm: 0, colour: 'auto', lock: false, ...d.h });
+        if (d.eco) {
+          store.getState().regenerateHarmony(false);
+          const p = store.getState().project;
+          const lead = p.tracks[0], pad = p.tracks[2];
+          store.getState().setPatch(lead.id, window.__aperture.api.instrument('Bell / FM Tone'));
+          const mallet = store.getState().addTrack('melody', 'Digital Mallet');
+          const brush = { ...store.getState().ui.brush, kind: 'note', density: 2, duration: 2 };
+          const pts = Array.from({ length: 24 }, (_, i) => ({ x: i / 24, y: 0.35 + 0.25 * Math.sin((i / 24) * Math.PI * 4) }));
+          store.getState().commit((q) => ({ ...q, tracks: q.tracks.filter((t) => t.role !== 'percussion' && t.role !== 'bass'),
+            orbital: { voices: [{ id: 'orb_1', bars: 4, direction: 'cw', trackId: lead.id, strokes: [{ id: 'o1', trackId: lead.id, shape: 'freehand', brush, points: pts, seed: 1 }], pitch: 'guided', fill: true, adapt: 0.7 }], active: 'orb_1' },
+            particles: { count: 7, speed: 0.45, gravity: 0.15, bars: 16, seed: 3, quantize: 4, zones: [{ id: 'z1', x: 0, y: 0, w: 0.55, h: 0.6, trackId: mallet, behavior: 'melody', repeat: 0.3 }, { id: 'z2', x: 0.5, y: 0.35, w: 0.5, h: 0.65, trackId: pad.id, behavior: 'chord', repeat: 0.2 }] } }));
+          store.getState().setMix(mallet, { delay: 0.25, reverb: 0.35 });
+          store.getState().regenerateOrbital();
+        } else {
+          store.getState().setComposition({ structure: 'arc', irregularity: 0.3, tension: 0.4, time: 'metric', ...d.c });
+          store.getState().generateComposition(undefined, false);
+        }
+      }, d);
+      const data = await st(() => {
+        const { store, api } = window.__aperture; const p = store.getState().project; const ctx = api.projectContext(p);
+        const names = (pc) => api.pcName(pc, p.settings.key, p.settings.scale);
+        return { pcs: ctx.pcs, bpm: p.settings.bpm, ts: p.settings.timeSig, bb: { '4/4': 4, '3/4': 3, '6/8': 3, '5/4': 5, '7/8': 3.5, '9/8': 4.5 }[p.settings.timeSig],
+          chords: ctx.slots.slice(0, 12).map((x) => api.chordSymbol(x.chord, names)).join(' '),
+          tracks: p.tracks.filter((t) => t.notes.length).map((t) => ({ name: t.name, role: t.role, drums: t.pitch.mode === 'drums', notes: t.notes.map((n) => ({ s: n.start, d: n.dur, m: n.midi, ct: api.slotAt(ctx, n.start).chord.pcs.includes(((n.midi % 12) + 12) % 12), outCh: (api.slotAt(ctx, n.start).chord.outside ?? []).includes(((n.midi % 12) + 12) % 12) })) })) };
+      });
+      const r = await render({ tail: 4, audit: true, save: true });
+      fs.writeFileSync(`${MDIR}${d.name}.wav`, Buffer.from(r.wav, 'base64'));
+      fs.writeFileSync(`${MDIR}${d.name}-spectrogram.png`, Buffer.from(r.png.split(',')[1], 'base64'));
+      const pitched = data.tracks.filter((t) => !t.drums).flatMap((t) => t.notes);
+      const inScale = pitched.filter((n) => data.pcs.includes(pcOf(n.m))).length / Math.max(1, pitched.length);
+      const exceptions = pitched.filter((n) => !data.pcs.includes(pcOf(n.m)));
+      const ct = pitched.filter((n) => n.ct).length / Math.max(1, pitched.length);
+      const melT = data.tracks.find((t) => t.role === 'melody' && t.notes.length > 4) ?? data.tracks.find((t) => !t.drums);
+      const mel = [...(melT?.notes ?? [])].sort((a, b) => a.s - b.s);
+      const units = new Map();
+      for (const n of mel) { const k = Math.floor(n.s / data.bb); units.set(k, [...(units.get(k) ?? []), n]); }
+      const sig = [...units.values()].filter((u) => u.length >= 2).map((u) => ({ on: u.map((n) => (n.s % data.bb).toFixed(2)).join(','), shape: u.slice(1).map((n, i) => Math.sign(n.m - u[i].m)).join('') }));
+      const recurrent = sig.filter((x, i) => i && sig.slice(0, i).some((y) => y.on === x.on || y.shape === x.shape)).length / Math.max(1, sig.length - 1);
+      const distinct = new Set([...units.values()].map((u) => u.map((n) => n.m).join(','))).size / Math.max(1, units.size);
+      const secs = r.f.seconds;
+      let poly = 0;
+      for (const n of pitched) { const c = pitched.filter((o) => o.s <= n.s + 1e-6 && o.s + o.d > n.s + 1e-6).length; poly = Math.max(poly, c); }
+      const lo = Math.min(...pitched.map((n) => n.m)), hi = Math.max(...pitched.map((n) => n.m));
+      const row = {
+        demo: d.name, seconds: +secs.toFixed(1), chords: data.chords,
+        scaleMembership: +(inScale * 100).toFixed(1), chordToneShare: +(ct * 100).toFixed(1),
+        exceptions: exceptions.length, exceptionsThatAreChordTones: exceptions.filter((n) => n.outCh).length,
+        melodyUnitsRecurring: +(recurrent * 100).toFixed(0), melodyUnitsDistinct: +(distinct * 100).toFixed(0),
+        notesPerSecond: +(pitched.length / Math.max(1, secs)).toFixed(2), register: `${lo}–${hi}`, maxPolyphony: poly,
+        peakDb: +(20 * Math.log10(Math.max(1e-9, r.f.peak))).toFixed(1), rmsDb: +(20 * Math.log10(Math.max(1e-9, r.f.rms))).toFixed(1), overCeilingPct: +r.f.overPct.toFixed(3), clicks: r.tonal?.clicks ?? null, onsets: r.f.onsets.length,
+      };
+      report.push(row);
+      summary.push(`${d.name}: ${row.seconds}s · ${row.chords} · in-scale ${row.scaleMembership}% (exceptions ${row.exceptions}, of which chord tones ${row.exceptionsThatAreChordTones}) · chord tones ${row.chordToneShare}% · melody units recurring ${row.melodyUnitsRecurring}% / distinct ${row.melodyUnitsDistinct}% · ${row.notesPerSecond} notes/s · register ${row.register} · polyphony ${row.maxPolyphony} · peak ${row.peakDb} dBFS · RMS ${row.rmsDb} dB · over-ceiling ${row.overCeilingPct}% · clicks ${row.clicks}${r.tonal?.byTrack ? ` [${r.tonal.byTrack.join('; ')}]` : ''}`);
+      const strictOk = d.h.behavior !== 'strict' || row.scaleMembership === 100;
+      check(`musical demo “${d.name}”: audible, unclipped, click-free${d.h.behavior === 'strict' ? ', 100 % in scale' : ''}`, r.f.rms > 0.003 && r.f.peak < 0.99 && r.f.overPct < 0.5 && (!r.tonal || r.tonal.clicks === 0) && strictOk, summary[summary.length - 1]);
+    }
+    fs.writeFileSync(`${MDIR}report.json`, JSON.stringify(report, null, 2));
+    fs.writeFileSync(`${MDIR}report.txt`, summary.join('\n') + '\n');
   }
 
   check('no uncaught errors in the console', errors.length === 0, errors.slice(0, 3).join(' | '));

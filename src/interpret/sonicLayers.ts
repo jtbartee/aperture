@@ -6,7 +6,9 @@ import { hash32, rng } from '../core/rng';
 import { type Curve, type FeatureGrid, type MaskFn, bandMask, fullMask } from '../analysis/features';
 import type { Contour, ContourSet } from '../analysis/contours';
 import type { ChordSlot } from '../theory/progression';
-import { allowedPitches, mapY, scaleIntervals } from '../theory/scales';
+import { allowedPitches, degreeToMidi, inScale, mapY, midiToDegree } from '../theory/scales';
+import { chordAt } from '../theory/progression';
+import { degreeBase } from './remap';
 import { instrument } from '../audio/patches';
 import { type SynthCharacter, densityMod, deriveImageSynth, regionFeatures, synthLanes } from '../audio/imageSynth';
 import { contourCount, contourVoice, type ScanSeg, textureEvents, timedEvents, visualEvents, voicePitch } from './sonify';
@@ -139,7 +141,8 @@ export function atmosphereLayer(ctx: SonicContext, key: string, name: string): L
   const cv = ctx.curve(fullMask, { strip: 2, smoothing: 0.7 });
   const l = layer(key, name, 'drone', ctx.origin === 'image' ? 'imageAtmos' : 'panorama', { color: '#8fa3b8', mix: { volume: -6, reverb: 0.55, delay: 0.05 } });
   const pitches = allowedPitches(l.pitch, ctx.ps.key, ctx.ps.scale, ctx.ps.customScale);
-  const per = scaleIntervals(ctx.ps.scale, ctx.ps.customScale).length;
+  const { key: tonicPc, scale, customScale } = ctx.ps;
+  const base = degreeBase(l);
   const at = (k: keyof Curve, t: number) => { const a = cv[k] as Float32Array; const x = c01(t / ctx.beats) * (cv.n - 1); const i = Math.floor(x); return i >= cv.n - 1 ? a[cv.n - 1] : a[i] + (a[i + 1] - a[i]) * (x - i); };
   const ev = c01(ctx.shape.evolution);
   const thr = 0.6 - ev * 0.35;
@@ -158,12 +161,21 @@ export function atmosphereLayer(ctx: SonicContext, key: string, name: string): L
     const bright = at('brightness', (s0 + s1) / 2);
     const vel = 0.42 + at('saturation', s0) * 0.3;
     if (ctx.shape.structure >= 0.3) {
-      // tonal: the key's root, with a fifth above (and an octave when the image is busy)
+      // tonal: the tonic (or, at high structure, the root of the image harmony's chord) with its
+      // fifth above and an octave when the image is busy. Degree-based, so a key change re-pitches it.
       const oct = bright < 0.25 ? 0 : bright > 0.6 ? 2 : 1;
-      const root = per * oct;
-      const degs = [root, root + (per >= 7 ? 4 : Math.round(per * 0.6))];
-      if (at('texture', s0) > 0.4) degs.push(root + per);
-      degs.forEach((d, j) => notes.push({ id: `${key}_${k++}`, start: s0 + j * 0.02, dur: s1 - s0, midi: mapY(0, pitches, d), vel: vel * (j ? 0.75 : 1), origin: ctx.origin, pitchY: 0, stepOffset: d || undefined }));
+      const slot = ctx.shape.structure >= 0.6 && ctx.harmony.length ? chordAt(ctx.harmony, s0) : undefined;
+      const rootPc = slot && inScale(slot.bassPc, tonicPc, scale, customScale) ? slot.bassPc : tonicPc;
+      const tonicMidi = base + (((tonicPc - base) % 12) + 12) % 12;
+      const rootMidi = tonicMidi + ((((rootPc - tonicPc) % 12) + 12) % 12) + 12 * oct;
+      const fifth = inScale(rootMidi + 7, tonicPc, scale, customScale) ? rootMidi + 7 : rootMidi + 12;
+      const tones = [rootMidi, fifth];
+      if (at('texture', s0) > 0.4) tones.push(rootMidi + 12);
+      tones.forEach((m, j) => {
+        const degree = midiToDegree(m, tonicPc, scale, base, customScale);
+        const midi = degreeToMidi(degree, tonicPc, scale, base, customScale);
+        notes.push({ id: `${key}_${k++}`, start: s0 + j * 0.02, dur: s1 - s0, midi, vel: vel * (j ? 0.75 : 1), origin: ctx.origin, degree });
+      });
     } else {
       // image-led: the pitch sits where the light sits
       const y = c01(at('centroid', s0));

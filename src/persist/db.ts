@@ -55,6 +55,18 @@ export async function listProjects(): Promise<ProjectMeta[]> {
 export const putAsset = (id: string, blob: Blob) => tx<IDBValidKey>('assets', 'readwrite', (s) => s.put(blob, id));
 export const getAsset = (id: string) => tx<Blob | undefined>('assets', 'readonly', (s) => s.get(id));
 export const deleteAsset = (id: string) => tx<undefined>('assets', 'readwrite', (s) => s.delete(id));
+export const listAssetIds = () => tx<IDBValidKey[]>('assets', 'readonly', (s) => s.getAllKeys()).then((k) => (k ?? []).map(String));
+
+/** Delete stored image blobs that no saved project and nothing in `keep` (the open project and its
+ *  undo history) references. Removing or replacing a source never deletes a blob another project,
+ *  or an undo step, still needs. Returns the ids removed. */
+export async function gcAssets(keep: Set<string>): Promise<string[]> {
+  const all = await tx<Project[]>('projects', 'readonly', (s) => s.getAll());
+  for (const p of all ?? []) for (const id of [p.image?.asset.assetId, p.panorama?.asset.assetId]) if (id) keep.add(id);
+  const gone: string[] = [];
+  for (const id of await listAssetIds()) if (!keep.has(id)) { await deleteAsset(id); gone.push(id); }
+  return gone;
+}
 
 export async function storageEstimate(): Promise<{ usage: number; quota: number } | null> {
   try {

@@ -6,6 +6,7 @@ import { fullMask, regionCurve } from '../../analysis/features';
 import { allowedPitches, yForMidi } from '../../theory/scales';
 import type { Region } from '../../core/types';
 import { hexA, useStageCanvas } from '../canvas';
+import { SourceBar } from '../SourceActions';
 import { drawContours } from '../contourDraw';
 import { laneValue, cutoffFromNorm } from '../../audio/graph';
 import { unit } from '../../audio/imageSynth';
@@ -294,6 +295,7 @@ export function PanoramaView() {
   const secs = panoramaSeconds(pano.settings, project.settings);
   return (
     <>
+      <SourceBar kind="panorama" top={OV + 12} />
       <canvas ref={ref} onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp} onWheel={onWheel}
         style={{ cursor: ui.panoTool === 'scrub' ? 'ew-resize' : 'crosshair' }} role="img"
         aria-label={`Panorama ${pano.asset.name}. The image scrolls under a fixed playhead. Drag to scrub, click the overview strip to jump.`} />

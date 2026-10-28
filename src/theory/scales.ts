@@ -152,3 +152,46 @@ export function midiToDegree(midi: number, root: number, scale: ScaleId, base: n
   for (let i = 0; i < iv.length; i++) if (Math.abs(iv[i] - pc) < Math.abs(iv[best] - pc)) best = i;
   return best + oct * iv.length;
 }
+
+// ------------------------------------------------------------------ scale character
+// Different scales need different harmony rules. A seven-note scale stacks thirds; pentatonic,
+// blues, symmetric and custom scales do not, so harmony for them is chosen from chord shapes
+// whose tones the scale actually contains (src/theory/chords.ts).
+
+export type ScaleFamily = 'heptatonic' | 'pentatonic' | 'blues' | 'symmetric' | 'chromatic' | 'other';
+
+export function scaleFamily(scale: ScaleId, custom?: number[]): ScaleFamily {
+  if (scale === 'majorBlues' || scale === 'minorBlues') return 'blues';
+  if (scale === 'wholeTone' || scale === 'octatonic') return 'symmetric';
+  if (scale === 'chromatic') return 'chromatic';
+  const n = scaleIntervals(scale, custom).length;
+  if (n === 7) return 'heptatonic';
+  if (n === 5) return 'pentatonic';
+  return n >= 11 ? 'chromatic' : 'other';
+}
+
+/** Modes whose identity comes from one or two "colour" tones rather than a leading-tone cadence. */
+export const MODAL_SCALES = new Set<ScaleId>(['dorian', 'phrygian', 'lydian', 'mixolydian', 'locrian', 'phrygianDominant']);
+
+/** Intervals above the tonic that give a scale its character (what makes Dorian not minor). */
+export const CHARACTERISTIC: Partial<Record<ScaleId, number[]>> = {
+  major: [4, 11], minor: [8], harmonicMinor: [8, 11], melodicMinor: [9, 11], dorian: [9], phrygian: [1],
+  lydian: [6], mixolydian: [10], locrian: [1, 6], phrygianDominant: [1, 4], minorBlues: [6], majorBlues: [3],
+  wholeTone: [6, 8], octatonic: [3, 6],
+};
+
+export function characteristicPcs(root: number, scale: ScaleId): number[] {
+  return (CHARACTERISTIC[scale] ?? []).map((i) => (root + i) % 12);
+}
+
+const ORD = ['1st', '2nd', '3rd', '4th', '5th', '6th', '7th', '8th'];
+const INTERVAL_NAME = ['root', '♭9', '9th', '♯9 / minor 3rd', 'third', '4th / 11th', '♯11 / ♭5', 'fifth', '♯5 / ♭13', '6th / 13th', '7th', 'major 7th'];
+
+/** "6th degree" for a pitch class of the scale, or null when it is outside the scale. */
+export function degreeOrdinal(pc: number, root: number, scale: ScaleId, custom?: number[]): string | null {
+  const iv = scaleIntervals(scale, custom);
+  const k = iv.indexOf((((pc - root) % 12) + 12) % 12);
+  return k < 0 ? null : `${ORD[k] ?? `${k + 1}th`} degree`;
+}
+
+export const intervalName = (semis: number) => INTERVAL_NAME[((semis % 12) + 12) % 12];
