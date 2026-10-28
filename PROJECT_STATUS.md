@@ -1,13 +1,14 @@
 # APERTURE — project status
 
-Last updated: 2026-10-28. Repository: `aperture` (Vite base `/aperture/`).
+Last updated: 2026-10-28 (Revision 4: audio performance). Repository: `aperture` (Vite base `/aperture/`).
 
 Legend: ✅ complete and tested · 🟡 implemented, needs more testing · 🚧 in progress · ⬜ not started
 
 ## Verification at a glance
-- `npm test` — 136 unit tests, all passing (musical acceptance A–K and engine contracts in `musical.test.ts`; Part 19 examples A–J; contour fidelity; sonification results).
+- `npm test` — 150 unit tests, all passing (musical acceptance A–K and engine contracts in `musical.test.ts`; Part 19 examples A–J; contour fidelity; sonification results; audio performance in `audioPerf.test.ts`).
 - `npm run e2e` — headless-Chromium suite, groups `draw synth image panorama generative export factory ui audio sonify musical`; 99/99 passing on 2026-10-28. Audio is measured (analyser RMS, offline renders, decoded WAVs, clipping and click audits, spectral centroid and onset analysis).
-- Tested in Chrome for Testing (Chromium) only. **Not yet tested in Safari or Firefox, on touch devices, or with real MIDI hardware.**
+- `npm run stress` — high-polyphony audio stress test (Revision 4), 24/24 headless; `HEADFUL=1` adds real-device underrun counts.
+- Tested in Chrome for Testing (Chromium 151) and, for audio performance, the installed Google Chrome 156 on an Apple-silicon Mac. **Not yet tested in Safari or Firefox, on touch devices, or with real MIDI hardware.**
 
 ## Phases
 
@@ -100,9 +101,49 @@ Legend: ✅ complete and tested · 🟡 implemented, needs more testing · 🚧 
 - Orbital notes that move to chord tones keep their radius position (`pitchY`); a key change regenerates them rather than remapping.
 - The composer's MIDI keeps chromatic passing tones as plain notes (no pitch bend).
 
+## Revision 4 — audio crackle, stutter and distortion repair (2026-10-28)
+
+**Report:** Generative → Drone / Experimental + an imported photograph + MOD routes crackles, stutters and distorts when many channels play, especially with overlapping sustained sounds.
+
+**Root cause (measured): the realtime audio thread missed its deadline — output underruns, not clipping or scheduling.** The dominant cost was **convolution reverb**: in Google Chrome 156 (the installed browser) one 7 s `Tone.Reverb` with near-silent input costs 0.19 of the realtime budget on average and lifts the 95th-percentile render time from 0.15 to 0.67 of the deadline (bisected on an empty project). Drone / Experimental runs three: the master send plus one inside each Atmospheric Sweep insert (Drone and Pads). A 7–9 s Tone impulse is ≥ 2× longer than it needs to be — Tone's `decay` is not RT60 (τ = ln(decay+1)/ln 200, so "9 s" is −60 dB at 3 s) — and convolver cost grows with impulse length. Secondary costs: the Tone.js scaffolding of the modulation effects (each LFO is oscillator → gain → waveshaper → scale + constant sources; each wet/dry a constant source → panner → splitter → two gains), per-sample biquad coefficients for slow LFO sweeps, and ~6000 lane-automation events per second.
+
+Ruled out by measurement: clipping (offline renders peak −6.9 dBFS MOD off / −17 dBFS MOD on, worst-case maximum-depth unsmoothed cutoff/resonance/send/feedback routes −18.9 dBFS, 0 samples above −1 dBFS), clicks (0 isolated discontinuities in every stem), scheduling (0 late notes, ≥ 20 ms lookahead left, timer gaps ≤ 35–60 ms even while dragging a route slider at 30 Hz), MOD routing CPU (≈ no difference on vs off).
+
+Found on the way: **an audio-node leak** — every Image Synth voice stayed connected to the channel's always-running modulation buses, so finished voices were never collected (CDP node counts after GC: 1 670 → 3 270 → 4 870 over three 25 s plays); the live context was **standardized-audio-context's wrapper**, whose AudioParams have no `automationRate`; Tone's default AudioContext was left running beside the engine's.
+
+| Load (Drone/Exp. + photo + 64 routes), Chrome 156, real output device, 30 s, 2 trials | Original | Balanced (new default) | Performance |
+|---|---|---|---|
+| ×1 (9 sounding layers, 23 voices) | **4 / 6 underruns** (32 / 47 ms), render capacity mean 0.69, p95 1.00 | **0 / 0**, mean 0.36, p95 0.41–0.44 | 0 / 0, p95 0.40 |
+| ×2 (18 layers, 46 voices) | 2 280 / 2 120 underruns (18.0 / 16.7 s silent of 30) | **0 / 0**, p95 0.73–0.82 | 0 / 0, p95 0.76–0.79 |
+| ×3 (27 layers, ~70 voices) | 3 750 / 3 745 underruns (29.7 s silent) | 190 / 120 (1.1 / 0.7 s) | 99 / 31 (0.63 / 0.19 s) |
+| Output latency (measured) | 27.7 ms | 36.8 ms | 75.8 ms |
+
+Offline render load (render time ÷ audio time, same scenario): 33.8 % original → 25.7 % High quality → 20.5 % Balanced. Headless Chrome cannot show dropouts (its fake sink waits for the renderer), so underruns were measured in a visible window with `AudioContext.playbackStats`; earlier "baseline" runs made through a git worktree were discarded — an orphaned `vite preview` was serving the fixed build on the shared port (the stress test now verifies it is serving this checkout's `dist/index.html`).
+
+| Change | Where | Evidence |
+|---|---|---|
+| Native live AudioContext (Tone wraps it); Tone's idle default context closed | `audio/engine.ts` | `automationRate` reaches the nodes; one audio stream |
+| Native modulation / delay effects (phaser, chorus, auto-pan, auto-filter, feedback, ping-pong) replacing the Tone.js ones in inserts and the Atmospheric Sweep | `audio/nativeFx.ts`, `fx.ts` | stress test: −73 … −146 dB error vs Tone sample-for-sample; ping-pong echoes equal, ≤ 1 render quantum later per bounce (Tone's longer loop) |
+| Reverb impulse generated directly from Tone's recipe, cut at −90 dB, full-length normalisation baked in, seeded | `nativeFx.ts` (`reverbImpulse`), master bus, Reverb insert, Atmospheric Sweep | energy envelope within ±0.15 dB of Tone.Reverb over 60 dB of tail; 9 s → 4.5 s, 7 s → 4.1 s impulses; offline renders reproducible to −100 dBFS |
+| Block-rate (k-rate) slow modulation where the per-block step is provably inaudible (filter ≤ 1/96 octave, pitch ≤ 3 cents, pan ≤ 0.01); chorus delay sweeps and FM stay at sample rate | `audio/quality.ts`, voices, channel strip, inserts | phaser 2.6 → 1.5 % offline; a biquad only leaves the per-sample path when all four params are k-rate |
+| Image Synth bus taps disconnected when a voice ends | `voices.ts` | node count after GC 35 → 35 → 35 → 35 |
+| Lane automation sent only when a value changes (per channel object) | `engine.ts` | ~6000 → ~1100 events/s |
+| Set only changed insert parameters on sync (Tone's `rampTo` cancelled lane automation scheduled on the same param) | `fx.ts` (`changes`) | — |
+| Cost-weighted project-wide voice budget: release tails first (most faded, 50 ms fade), then held texture/arp/percussion notes (80 ms); drones, pads, bass, chords, melody never cut; no note dropped | `graph.ts` (`enforceBudget`) | scenario peak cost 225 vs Balanced 900; tight-budget render: 187 tails taken, 0 held, 0 clicks |
+| Processing profiles: Balanced (block rate, `playback` buffer, budget 900), High quality (sample rate, `balanced` buffer, 1800), Performance (block rate, 0.06 s buffer, 600); per browser, never stored in projects | `quality.ts`, Performance tab | table above |
+| Performance monitor (bottom panel → Performance): browser-reported underruns (Chrome 156+), latencies, voices / cost / budget, steals, notes and automation per second, least lookahead, late notes, timer gaps, frame times, pre/post-limiter peak and limiter reduction, on-demand offline load estimate (labelled as an estimate) | `audio/diagnostics.ts`, `ui/panels/PerfMonitor.tsx` | runs only while the tab is open; screenshot `tests/e2e/out/stress/performance-monitor.png` |
+| Stress test | `tests/e2e/stress.mjs` (`npm run stress`, `HEADFUL=1`, `SCALE=k`) | 24/24 headless and in Chrome 156 on the real device |
+
+**Known limitations (Revision 4)**
+- Measured on one Apple-silicon Mac in Chrome 156 and Chrome for Testing 151. Chrome 156's convolver is far more expensive than 151's; other machines and browsers will have different headroom. **Safari and Firefox are untested** (Firefox has no `automationRate`, so block rate is a no-op there; neither exposes underrun counts, so the monitor says so).
+- ×3 the scenario still overloads this machine in every profile (mean load ≈ 0.95); a buffer cannot absorb a sustained overload. The monitor reports it; removing an Atmospheric Sweep or Reverb insert is the biggest single saving.
+- No human listening test was made of the before/after; equivalence is by sample comparison and envelope measurement.
+- A MOD route to Level at depth ≥ 0.5 mutes a layer wherever its feature is near 0 (by design of the mapping); it is documented, not changed.
+- The test photograph (`tests/e2e/fixtures/photo.jpg`, a macOS wallpaper) is local only and gitignored; without it the stress test uses the procedural landscape.
+
 ## Architecture decisions to keep
 1. **Event data is the single source of truth.** `eventsInWindow()` (src/audio/schedule.ts) feeds the live scheduler and the offline renderer; `projectToMidi()` uses the same swing warp. Don't add a second note path.
-2. **Per-note native voices** (src/audio/voices.ts). Every source gets an explicit stop time; kills go through a per-voice gain ramp. Don't switch to pooled Tone instruments without re-running `npm run e2e -- audio`.
+2. **Per-note native voices** (src/audio/voices.ts). Every source gets an explicit stop time; kills go through a per-voice gain ramp. Don't switch to pooled Tone instruments without re-running `npm run e2e -- audio`. Anything a voice connects *from* a long-lived node (a channel bus) must be disconnected when it ends, or the voice is never collected.
 3. **Gain staging:** voice peak 0.85 × patch gain; channel fader; master −1 dB → glue compressor → 150 ms-release limiter (Tone.Limiter's 10 ms release crackles on kicks). Pads/drones are programmed 3–4 dB lower because chords stack.
 4. **Analysis cache:** `FeatureGrid` keeps per-cell edge histograms so sensitivity changes don't need pixels. Music generation must only read the grid / gestures.
 5. **Remap anchors:** notes carry `pitchY` (+`stepOffset`) or `degree`. Anything that generates notes should set one of them.
@@ -117,6 +158,10 @@ Legend: ✅ complete and tested · 🟡 implemented, needs more testing · 🚧 
 14. **Harmony parts carry function.** Mutation and probability never change the pitch of pads, chords or arpeggios or the bass under a chord arrival; the composer's final `fitToHarmony` enforces Strict/Expressive rules. Never use `Math.random()` in theory or interpret — including for pitch choice (`choosePitch` takes a seeded RNG or is argmax).
 15. **Music never steers particle physics**: pitch is chosen after the event; frames are identical with or without a musical context (unit-tested).
 16. **Removing a source is one pure operation** (`withoutSource` in state/music.ts) plus cache cleanup in the store; blobs are deleted only by `gcAssets` when no saved project, open project or undo step references them.
+17. **The live context is native, not standardized-audio-context** (`liveContext` in audio/engine.ts) — the wrapper hides `automationRate`. Effects that run continuously are native (`audio/nativeFx.ts`) and must stay sample-equivalent to their Tone.js originals (`npm run stress` checks it).
+18. **Realtime cost is a budget.** Every always-on node runs every 2.9 ms whether or not it is heard. Before adding an effect or voice component, measure it with `HEADFUL=1 SCALE=2 npm run stress` in the current Chrome: convolution reverbs are the most expensive nodes (Chrome 156); keep impulses no longer than their −90 dB point and prefer the shared master reverb to per-track ones.
+19. **Block rate only where the step is provably inaudible** (`audio/quality.ts` limits). A biquad only leaves the per-sample path when all four of its params are k-rate; a delay time must never be k-rate (it jumps the read position).
+20. **Measure dropouts on a real output device.** Headless Chrome's fake sink never underruns; CDP `renderCapacity` is a load hint, not a glitch count. Use `HEADFUL=1` (AudioContext `playbackStats`).
 
 ## Resuming
 - Start with `npm install && npm test && npm run build && npm run e2e`.

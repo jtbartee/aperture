@@ -4,15 +4,41 @@
 //   master → glue compressor → limiter (150 ms release) → destination
 
 import * as Tone from 'tone';
-import type { AutomationLane, ModTarget, NoteEvent, Project, Track } from '../core/types';
+import type { AutomationLane, ModTarget, NoteEvent, Project, Role, Track } from '../core/types';
 import { createFx, type FxUnit } from './fx';
-import { type BusName, dbToGain, startVoice, type Voice, type VoiceOpts } from './voices';
+import { type BusName, dbToGain, startVoice, type Voice, type VoiceOpts, voiceCost } from './voices';
 import { defaultImageParams, unit } from './imageSynth';
 import { audible } from './graph-audible';
+import { QUALITY, type QualityProfile, biquadParams, blockRate } from './quality';
+import { NativeFeedbackDelay, NativeReverb } from './nativeFx';
 
 export { audible };
 
 export const cutoffFromNorm = (v: number) => 60 * Math.pow(2, Math.max(0, Math.min(1, v)) * 8.2);
+
+/** How much a role's held notes matter when the global budget must cut one short (higher = kept
+ *  longer). Release tails are always taken before any held note. */
+const ROLE_WEIGHT: Record<Role, number> = { drone: 6, pad: 5, bass: 5, chords: 4, melody: 4, arp: 2, texture: 1, percussion: 1 };
+
+const lfoMaxCache = new WeakMap<AutomationLane[], { rate: number; depth: number }>();
+/** The largest Image Synth LFO rate/depth a track's lanes reach (worst case for block-rate decisions). */
+function lfoLaneMax(lanes: AutomationLane[]): { rate: number; depth: number } {
+  let m = lfoMaxCache.get(lanes);
+  if (!m) {
+    m = { rate: 0, depth: 0 };
+    for (const l of lanes) {
+      if (l.target !== 'lfoRate' && l.target !== 'lfoDepth') continue;
+      const hi = l.points.reduce((a, pt) => Math.max(a, pt.value), 0);
+      if (l.target === 'lfoRate') m.rate = Math.max(m.rate, unit.lfoRate(hi));
+      else m.depth = Math.max(m.depth, unit.lfoDepth(hi));
+    }
+    lfoMaxCache.set(lanes, m);
+  }
+  return m;
+}
+
+/** Counters the performance monitor reads (cheap integer bumps on the scheduling path). */
+export interface GraphStats { triggered: number; stolenTails: number; stolenHeld: number; overBudget: number }
 
 export class Channel {
   readonly input: GainNode;
@@ -31,6 +57,7 @@ export class Channel {
   fx: FxUnit[] = [];
   fxKey = '';
   voices = new Set<Voice>();
+  role: Role = 'melody';
   lastMidi?: number;
   held = new Map<number, Voice>();
   /** constant-source buses that Image Synth voices follow while they sound */
@@ -51,6 +78,9 @@ export class Channel {
     this.tilt.gain.value = 0;
     this.autoGain = raw.createGain();
     this.autoPan = raw.createStereoPanner();
+    // lane automation arrives as 25 ms setTarget steps: block-rate filter/pan is inaudible and saves
+    // a per-sample coefficient computation on every channel (the gain stays at sample rate)
+    if (graph.quality.blockRate) blockRate(...biquadParams(this.autoFilter), ...biquadParams(this.tilt), this.autoPan.pan);
     this.panner = new Tone.Panner(0);
     this.fader = new Tone.Gain(1);
     this.muteGain = new Tone.Gain(1);
@@ -170,37 +200,45 @@ export class AudioGraph {
   readonly out: Tone.Gain;
   readonly reverbIn: Tone.Gain;
   readonly delayIn: Tone.Gain;
-  readonly reverb: Tone.Reverb;
-  readonly delay: Tone.FeedbackDelay;
-  readonly delayTone: Tone.Filter;
+  readonly reverb: NativeReverb;
+  readonly delay: NativeFeedbackDelay;
+  readonly delayTone: BiquadFilterNode;
   readonly analyser?: Tone.Analyser;
   readonly masterMeter?: Tone.Meter;
   readonly channels = new Map<string, Channel>();
   /** seconds per beat (for per-note pitch bends) */
   spb = 0.5;
+  stats: GraphStats = { triggered: 0, stolenTails: 0, stolenHeld: 0, overBudget: 0 };
   private ready: Promise<void>;
 
-  constructor(readonly live: boolean) {
+  constructor(readonly live: boolean, readonly quality: QualityProfile = QUALITY.high) {
     this.raw = Tone.getContext().rawContext as BaseAudioContext;
     this.master = new Tone.Gain(dbToGain(-1));
     this.glue = new Tone.Compressor({ threshold: -14, ratio: 2.5, attack: 0.02, release: 0.25, knee: 6 });
     this.limiter = new Tone.Compressor({ threshold: -1.5, ratio: 20, attack: 0.002, release: 0.15, knee: 1 });
     this.out = new Tone.Gain(1);
     this.master.chain(this.glue, this.limiter, this.out, Tone.getDestination());
+    // shared send buses (native: same impulse / delay as the Tone.js originals, fewer nodes)
     this.reverbIn = new Tone.Gain(1);
-    this.reverb = new Tone.Reverb({ decay: 7, preDelay: 0.03, wet: 1 });
-    this.reverbIn.chain(this.reverb, this.master);
+    this.reverb = new NativeReverb(this.raw, { decay: 7, preDelay: 0.03, wet: 1, seed: 1 });
+    Tone.connect(this.reverbIn, this.reverb.input);
+    Tone.connect(this.reverb.output, this.master);
     this.delayIn = new Tone.Gain(1);
-    this.delay = new Tone.FeedbackDelay({ delayTime: 0.375, feedback: 0.42, wet: 1, maxDelay: 2.5 });
-    this.delayTone = new Tone.Filter({ type: 'bandpass', frequency: 1400, Q: 0.6 });
-    this.delayIn.chain(this.delay, this.delayTone, this.master);
+    this.delay = new NativeFeedbackDelay(this.raw, { time: 0.375, feedback: 0.42, wet: 1, maxDelay: 2.5 });
+    this.delayTone = this.raw.createBiquadFilter();
+    this.delayTone.type = 'bandpass';
+    this.delayTone.frequency.value = 1400;
+    this.delayTone.Q.value = 0.6;
+    Tone.connect(this.delayIn, this.delay.input);
+    this.delay.output.connect(this.delayTone);
+    Tone.connect(this.delayTone, this.master);
     if (live) {
       this.analyser = new Tone.Analyser('waveform', 1024);
       this.masterMeter = new Tone.Meter({ smoothing: 0.8 });
       this.out.connect(this.analyser);
       this.out.connect(this.masterMeter);
     }
-    this.ready = this.reverb.ready.then(() => undefined);
+    this.ready = Promise.resolve();
   }
 
   async whenReady() {
@@ -215,11 +253,13 @@ export class AudioGraph {
     const anySolo = project.tracks.some((t) => t.mix.solo);
     const spb = 60 / project.settings.bpm;
     this.spb = spb;
-    this.delay.delayTime.rampTo(Math.min(2.4, spb * 0.75), 0.05);
+    const dt = Math.min(2.4, spb * 0.75);
+    if (Math.abs(this.delay.delay.delayTime.value - dt) > 1e-6) this.delay.delay.delayTime.setTargetAtTime(dt, this.raw.currentTime, 0.02);
     for (const t of project.tracks) {
       let ch = this.channels.get(t.id);
       if (!ch) { ch = new Channel(this, t.id); this.channels.set(t.id, ch); }
       ch.patch = t.patch;
+      ch.role = t.role;
       ch.panner.pan.rampTo(t.mix.pan, 0.03);
       ch.fader.gain.rampTo(dbToGain(t.mix.volume), 0.03);
       ch.muteGain.gain.rampTo(audible(t, anySolo) ? 1 : 0, 0.02);
@@ -227,7 +267,7 @@ export class AudioGraph {
       ch.sendD.gain.rampTo(t.mix.delay, 0.03);
       const key = t.fx.filter((f) => f.on).map((f) => `${f.id}:${f.type}`).join('|');
       if (key !== ch.fxKey) {
-        ch.setFx(t.fx.filter((f) => f.on).map((f) => createFx(f)), key);
+        ch.setFx(t.fx.filter((f) => f.on).map((f) => createFx(f, { blockRate: this.quality.blockRate, sampleRate: this.raw.sampleRate })), key);
       } else {
         t.fx.filter((f) => f.on).forEach((f, i) => ch!.fx[i]?.set({ ...f.params }));
       }
@@ -248,25 +288,68 @@ export class AudioGraph {
         for (let i = 0; i <= sounding.length - p.poly; i++) { sounding[i].kill(time); ch.voices.delete(sounding[i]); }
       }
     }
-    const o: VoiceOpts = { glideFrom: p.poly === 1 ? ch.lastMidi : undefined, timbre: note.timbre, bend: note.bend, spb: this.spb, bendOffset: fromBeat !== undefined ? Math.max(0, fromBeat - note.start) : 0 };
+    this.enforceBudget(time, voiceCost(p, this.quality.blockRate));
+    const o: VoiceOpts = { glideFrom: p.poly === 1 ? ch.lastMidi : undefined, timbre: note.timbre, bend: note.bend, spb: this.spb, bendOffset: fromBeat !== undefined ? Math.max(0, fromBeat - note.start) : 0, blockRate: this.quality.blockRate };
     for (const lane of track.automation) {
       if (lane.target !== 'attack' && lane.target !== 'release' && lane.target !== 'fmRatio') continue;
       const v = laneValue(lane, note.start);
       if (v !== null) o[lane.target] = unit[lane.target](v);
     }
-    if (p.engine === 'image') o.bus = (n) => ch.bus(n);
+    if (p.engine === 'image') { o.bus = (n) => ch.bus(n); o.lfoMax = lfoLaneMax(track.automation); }
     const v = startVoice(this.raw, ch.input, p, note.midi, note.vel, time, dur, o);
     ch.lastMidi = note.midi;
     ch.voices.add(v);
+    this.stats.triggered++;
     // prune finished voices so the set stays small
     if (ch.voices.size > 64) for (const x of ch.voices) if (x.end < time - 0.5) ch.voices.delete(x);
     return v;
+  }
+
+  /** Project-wide voice budget, weighted by each voice's rendering cost. Per-channel polyphony
+   *  alone does not bound the total: thirteen channels of long-release drones and pads can each be
+   *  within their limit while the sum overruns the audio thread. When a new voice would exceed the
+   *  budget, release tails go first (the most faded first), then — only if still over — held notes
+   *  of the least structural roles, oldest first. Drones, pads and bass are never cut, and a note is
+   *  never dropped: if nothing may be taken the voice plays over budget (counted in stats). */
+  private enforceBudget(time: number, cost: number) {
+    const budget = this.quality.voiceBudget;
+    let total = cost;
+    const sounding: { ch: Channel; v: Voice }[] = [];
+    for (const ch of this.channels.values()) {
+      for (const v of ch.voices) {
+        if (v.end <= time || v.start > time + 1e-3) continue;
+        total += v.cost;
+        sounding.push({ ch, v });
+      }
+    }
+    if (total <= budget) return;
+    const take = (x: { ch: Channel; v: Voice }, fade: number) => { x.v.kill(time, fade); x.ch.voices.delete(x.v); total -= x.v.cost; };
+    // 1. release tails, furthest into their release first (quietest)
+    const tails = sounding.filter((x) => x.v.gateOff <= time && x.ch.patch?.engine !== 'drums');
+    tails.sort((a, b) => (time - b.v.gateOff) / Math.max(1e-3, b.v.end - b.v.gateOff) - (time - a.v.gateOff) / Math.max(1e-3, a.v.end - a.v.gateOff));
+    for (const x of tails) { if (total <= budget) return; take(x, 0.05); this.stats.stolenTails++; }
+    // 2. held notes of non-structural roles, least significant then oldest first, with a longer fade
+    const held = sounding.filter((x) => x.v.gateOff > time && x.v.end > time && ROLE_WEIGHT[x.ch.role] <= 2);
+    held.sort((a, b) => ROLE_WEIGHT[a.ch.role] - ROLE_WEIGHT[b.ch.role] || a.v.start - b.v.start);
+    for (const x of held) { if (total <= budget) return; take(x, 0.08); this.stats.stolenHeld++; }
+    if (total > budget) this.stats.overBudget++;
   }
 
   activeVoices(at: number): number {
     let n = 0;
     for (const ch of this.channels.values()) for (const v of ch.voices) if (v.end > at) n++;
     return n;
+  }
+
+  /** Voices, their summed cost and the channels with sound at `at` (for the performance monitor). */
+  load(at: number): { voices: number; cost: number; channels: number } {
+    let voices = 0, cost = 0, channels = 0;
+    for (const ch of this.channels.values()) {
+      let any = false;
+      for (const v of ch.voices) if (v.end > at && v.start <= at) { voices++; cost += v.cost; any = true; }
+      if (any) channels++;
+    }
+    return { voices, cost, channels };
   }
 
   killAll(t: number) {
@@ -289,7 +372,10 @@ export class AudioGraph {
   dispose() {
     for (const ch of this.channels.values()) ch.dispose();
     this.channels.clear();
-    for (const n of [this.master, this.glue, this.limiter, this.out, this.reverbIn, this.reverb, this.delayIn, this.delay, this.delayTone, this.analyser, this.masterMeter]) n?.dispose();
+    for (const n of [this.master, this.glue, this.limiter, this.out, this.reverbIn, this.delayIn, this.analyser, this.masterMeter]) n?.dispose();
+    this.reverb.dispose();
+    this.delay.dispose();
+    this.delayTone.disconnect();
   }
 }
 

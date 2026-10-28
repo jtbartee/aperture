@@ -144,6 +144,16 @@ table.grid select, table.grid input { width: 100%; }
 /* ---------- bottom */
 .bottom-bar { display: flex; align-items: center; gap: 6px; padding: 0 8px; border-bottom: 1px solid var(--line); height: 32px; }
 .bottom-body { height: 236px; display: flex; min-height: 0; }
+.perf { flex: 1; display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 6px; padding: 8px; overflow: auto; align-content: start; }
+.perf-card { border: 1px solid var(--line); border-radius: 6px; background: var(--panel-2); padding: 6px 8px; min-width: 0; }
+.perf-card.wide { grid-column: span 2; }
+.perf-card h4 { margin: 0 0 4px; font-size: 11px; font-weight: 600; color: var(--text-2); text-transform: uppercase; letter-spacing: 0.04em; }
+.perf-card dl { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; margin: 0; font-size: 11.5px; }
+.perf-card dt { color: var(--text-3); }
+.perf-card dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+.perf-card dd.warn { color: #f0c58a; }
+.perf-card dd.bad { color: #f6a08f; }
+@media (max-width: 700px) { .perf-card.wide { grid-column: auto; } }
 .bottom.closed .bottom-body { display: none; }
 .timeline { position: relative; height: 30px; border-bottom: 1px solid var(--line); background: var(--panel-2); cursor: pointer; }
 .timeline canvas { position: absolute; inset: 0; width: 100%; height: 100%; }

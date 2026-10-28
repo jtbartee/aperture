@@ -6,12 +6,41 @@
 import * as Tone from 'tone';
 import type { NoteEvent, Project, Track } from '../core/types';
 import { TIME_SIGS, barBeats, projectBeats } from '../core/time';
-import { AudioGraph, laneValue } from './graph';
+import { AudioGraph, type Channel, laneValue } from './graph';
 import { chaseNotes, eventsInWindow } from './schedule';
 import { startVoice, type Voice } from './voices';
+import { type AudioQuality, QUALITY, type QualityProfile, loadQuality, saveQuality } from './quality';
 
 const LOOKAHEAD = 0.12;
 const TICK_MS = 25;
+/** a lane value is re-sent only when it moved by more than this (normalised units) */
+const LANE_EPS = 1 / 1024;
+
+/** The live context wraps a *native* AudioContext. Tone's default (standardized-audio-context)
+ *  wraps every node and parameter in JS objects whose AudioParams have no `automationRate`, so
+ *  block-rate modulation (audio/quality.ts) could not reach the real nodes. Offline renders already
+ *  use a native OfflineAudioContext. */
+function liveContext(hint: AudioContextLatencyCategory | number): Tone.Context {
+  // Tone only records the hint (its type omits the numeric form the native constructor accepts)
+  return new Tone.Context({ context: new AudioContext({ latencyHint: hint }), latencyHint: hint as AudioContextLatencyCategory, lookAhead: 0 });
+}
+
+/** Scheduler counters for the performance monitor. Cheap to keep (a few compares per note);
+ *  `takePerf()` returns them and starts a new window. */
+export interface SchedulerPerf {
+  /** wall-clock window length, ms */
+  windowMs: number;
+  ticks: number;
+  /** largest gap between scheduler ticks (main-thread stalls show up here), ms */
+  tickGapMaxMs: number;
+  notes: number;
+  /** smallest remaining lookahead when a note was handed to the audio graph, ms (Infinity = none) */
+  marginMinMs: number;
+  /** notes whose start time had already passed when scheduled (they start late) */
+  late: number;
+  /** lane automation events sent to AudioParams */
+  automation: number;
+}
 
 interface Segment { ctx: number; beat: number; bps: number }
 interface Swap { trackId: string; at: number; commit: () => void }
@@ -32,8 +61,47 @@ export class LiveEngine {
   scheduledCount = 0;
   scheduledLog: { id: string; beat: number }[] = [];
   logScheduling = false;
+  quality: QualityProfile = QUALITY[loadQuality()];
+  /** last value sent per lane, per channel object (a rebuilt channel starts empty and gets every lane) */
+  private laneSent = new WeakMap<Channel, Map<string, number>>();
+  private ownContext = false;
+  private perf = { t0: 0, ticks: 0, lastTick: 0, gapMax: 0, notes: 0, marginMin: Infinity, late: 0, automation: 0 };
 
   constructor(private getProject: () => Project) {}
+
+  /** Scheduler counters since the previous call (see SchedulerPerf). */
+  takePerf(): SchedulerPerf {
+    const now = performance.now();
+    const p = this.perf;
+    const out = { windowMs: p.t0 ? now - p.t0 : 0, ticks: p.ticks, tickGapMaxMs: p.gapMax, notes: p.notes, marginMinMs: p.marginMin * 1000, late: p.late, automation: p.automation };
+    this.perf = { t0: now, ticks: 0, lastTick: p.lastTick, gapMax: 0, notes: 0, marginMin: Infinity, late: 0, automation: 0 };
+    return out;
+  }
+
+  /** Switch the performance profile: rebuilds the audio graph (and the AudioContext when the
+   *  latency hint differs) and resumes playback where it was. */
+  async setQuality(q: AudioQuality) {
+    if (q === this.quality.id) return;
+    const prev = this.quality;
+    this.quality = QUALITY[q];
+    saveQuality(q);
+    if (!this.graph) return;
+    const wasPlaying = this.state === 'playing';
+    const pos = this.position();
+    if (wasPlaying) { this.halt(); this.state = 'paused'; this.parked = pos; }
+    this.held.clear();
+    const old = this.graph;
+    this.graph = null;
+    old.dispose();
+    if (prev.latencyHint !== this.quality.latencyHint) {
+      const oldCtx = Tone.getContext();
+      Tone.setContext(liveContext(this.quality.latencyHint));
+      try { await oldCtx.dispose(); } catch { /* already closed */ }
+    }
+    await this.ensure();
+    if (wasPlaying) await this.play(pos);
+    this.emit();
+  }
 
   get ready() { return !!this.graph; }
 
@@ -43,9 +111,16 @@ export class LiveEngine {
       if (this.graph.live && Tone.getContext().state !== 'running') await Tone.start();
       return this.graph;
     }
-    Tone.setContext(new Tone.Context({ latencyHint: 'balanced', lookAhead: 0 }));
+    if (!this.ownContext) {
+      // Tone creates a default context when it loads; replace it (and close it, so an idle second
+      // audio stream is not left running) with one using the profile's latency hint
+      const initial = Tone.getContext();
+      Tone.setContext(liveContext(this.quality.latencyHint));
+      this.ownContext = true;
+      try { void initial.dispose(); } catch { /* never started */ }
+    }
     await Tone.start();
-    this.graph = new AudioGraph(true);
+    this.graph = new AudioGraph(true, this.quality);
     this.graph.sync(this.getProject());
     this.emit();
     return this.graph;
@@ -89,6 +164,7 @@ export class LiveEngine {
     this.cursor = beat;
     this.endCtx = null;
     for (const ch of g.channels.values()) ch.resetAutomation(now);
+    this.laneSent = new WeakMap();
     this.applyAutomation(p, beat, now);
     for (const ev of chaseNotes(p, beat)) this.fire(ev.track, ev.note, now, (ev.endBeat - beat) / bps, beat);
   }
@@ -115,6 +191,7 @@ export class LiveEngine {
   private halt() {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    this.perf.lastTick = 0;
     this.graph?.killAll(this.ctxTime);
     this.segs = [];
   }
@@ -167,7 +244,11 @@ export class LiveEngine {
     s.forEach((x) => x.commit());
   }
 
-  private fire(track: Track, note: NoteEvent, time: number, durSec: number, fromBeat?: number) {
+  private fire(track: Track, note: NoteEvent, time: number, durSec: number, fromBeat?: number, intended = time) {
+    const margin = intended - this.ctxTime;
+    if (margin < this.perf.marginMin) this.perf.marginMin = margin;
+    if (margin < 0) this.perf.late++;
+    this.perf.notes++;
     this.graph!.trigger(track, note, time, durSec, fromBeat);
     this.scheduledCount++;
     if (this.logScheduling) this.scheduledLog.push({ id: note.id, beat: note.start });
@@ -179,15 +260,27 @@ export class LiveEngine {
       if (!t.automation.length) continue;
       const ch = g.channels.get(t.id);
       if (!ch) continue;
+      let sent = this.laneSent.get(ch);
+      if (!sent) { sent = new Map(); this.laneSent.set(ch, sent); }
       for (const lane of t.automation) {
         const v = laneValue(lane, beat);
-        if (v !== null) ch.applyMod(lane.target, v, time, 0.06);
+        if (v === null) continue;
+        // a value the parameter is already gliding to needs no new event (most ticks, for slow lanes)
+        const last = sent.get(lane.id);
+        if (last !== undefined && Math.abs(last - v) <= LANE_EPS) continue;
+        sent.set(lane.id, v);
+        ch.applyMod(lane.target, v, time, 0.06);
+        this.perf.automation++;
       }
     }
   }
 
   tick() {
     if (this.state !== 'playing' || !this.graph) return;
+    const wall = performance.now();
+    if (this.perf.lastTick && wall - this.perf.lastTick > this.perf.gapMax) this.perf.gapMax = wall - this.perf.lastTick;
+    this.perf.lastTick = wall;
+    this.perf.ticks++;
     const now = this.ctxTime;
     if (this.endCtx !== null && now >= this.endCtx) { this.stop(); return; }
     let p = this.getProject();
@@ -230,7 +323,8 @@ export class LiveEngine {
     const now = this.ctxTime;
     const timeOf = (b: number) => seg.ctx + (b - seg.beat) / seg.bps;
     for (const ev of eventsInWindow(p, from, to)) {
-      this.fire(ev.track, ev.note, Math.max(now, timeOf(ev.beat)), (ev.endBeat - ev.beat) / seg.bps);
+      const at = timeOf(ev.beat);
+      this.fire(ev.track, ev.note, Math.max(now, at), (ev.endBeat - ev.beat) / seg.bps, undefined, at);
     }
     this.applyAutomation(p, from, Math.max(now, timeOf(from)));
     if (p.settings.metronome) {

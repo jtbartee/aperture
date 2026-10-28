@@ -3,3 +3,6 @@ dist
 *.log
 .DS_Store
 tests/e2e/out
+
+# local test photograph (not redistributable)
+tests/e2e/fixtures/

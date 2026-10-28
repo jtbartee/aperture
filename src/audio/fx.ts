@@ -1,6 +1,8 @@
 import * as Tone from 'tone';
 import type { EffectSlot, FxType, ModTarget } from '../core/types';
 import { crushCurve } from './voices';
+import { BLOCK, MAX_FILTER_STEP_OCT, MAX_PAN_STEP, biquadParams, blockRate, lfoBlockStep, sampleRateParams } from './quality';
+import { DryWet, NativeAutoFilter, NativeAutoPanner, NativeChorus, NativeFeedbackDelay, NativePhaser, NativePingPong, NativeReverb, type NativeFx } from './nativeFx';
 
 export interface ParamDef { key: string; label: string; min: number; max: number; step: number; def: number; unit?: string }
 export interface FxDef { type: FxType; label: string; params: ParamDef[] }
@@ -53,40 +55,94 @@ export interface FxUnit {
 
 const FILTER_MODES: BiquadFilterType[] = ['lowpass', 'highpass', 'bandpass'];
 
+/** How an insert is built: whether slow LFO sweeps may run at block rate (audio/quality.ts). */
+export interface FxContext { blockRate: boolean; sampleRate: number }
+
+/** Largest per-block step, in octaves, of a sine LFO sweeping a frequency linearly in Hz between
+ *  f and f·2^octaves (Tone's Phaser and AutoFilter): max |d ln f/dt| = ω(R−1)/(2√R). */
+export function sweepBlockStep(rate: number, octaves: number, sampleRate: number) {
+  const R = Math.pow(2, Math.max(0, octaves));
+  return (2 * Math.PI * Math.abs(rate) * (R - 1)) / (2 * Math.sqrt(R)) / Math.LN2 * (BLOCK / sampleRate);
+}
+
+/** Put parameters at block rate when allowed and the movement is slow enough, else sample rate. */
+function rateFor(fc: FxContext, params: (AudioParam | null)[], slow: boolean) {
+  if (fc.blockRate && slow) blockRate(...params);
+  else sampleRateParams(...params);
+}
+
+/** Calls `apply` with only the parameters that changed since the last call. sync() re-sends every
+ *  insert's parameters on any track edit; touching unchanged ones would cancel lane automation
+ *  already scheduled on them (and add needless automation events). */
+function changes(initial: Record<string, number>) {
+  let last = { ...initial };
+  return (q: Record<string, number>, apply: (changed: (k: string) => boolean) => void) => {
+    const prev = last;
+    last = { ...q };
+    if (Object.keys(q).every((k) => Math.abs(q[k] - prev[k]) < 1e-9)) return;
+    apply((k) => Math.abs(q[k] - prev[k]) >= 1e-9);
+  };
+}
+
+/** An insert built from native nodes (audio/nativeFx.ts). */
+function native(type: FxType, fx: NativeFx, set: FxUnit['set'], mod: FxUnit['mod'] = () => false, ready = Promise.resolve(), extra: { dispose(): void }[] = []): FxUnit {
+  return { type, input: fx.input, output: fx.output, set, mod, ready, dispose: () => { fx.dispose(); extra.forEach((e) => e.dispose()); } };
+}
+
 function simple<T extends Tone.ToneAudioNode>(type: FxType, node: T, set: (p: Record<string, number>) => void, mod: FxUnit['mod'] = () => false, ready = Promise.resolve(), extra: Tone.ToneAudioNode[] = []): FxUnit {
   return { type, input: node, output: node, set, mod, ready, dispose: () => { node.dispose(); extra.forEach((e) => e.dispose()); } };
 }
 
-export function createFx(slot: EffectSlot): FxUnit {
+export function createFx(slot: EffectSlot, fc: FxContext = { blockRate: false, sampleRate: 48000 }): FxUnit {
   const p = { ...defaultParams(slot.type), ...slot.params };
   switch (slot.type) {
     case 'delay': {
-      const d = new Tone.FeedbackDelay({ delayTime: p.time, feedback: p.feedback, wet: p.wet, maxDelay: 2.5 });
-      return simple('delay', d, (q) => { d.delayTime.rampTo(q.time, 0.05); d.feedback.rampTo(q.feedback, 0.05); d.wet.rampTo(q.wet, 0.05); },
-        (t, v, time) => { if (t !== 'delayFeedback') return false; d.feedback.setTargetAtTime(v * 0.9, time, 0.05); return true; });
+      const d = new NativeFeedbackDelay(Tone.getContext().rawContext as BaseAudioContext, { time: p.time, feedback: p.feedback, wet: p.wet, maxDelay: 2.5 });
+      const ch = changes(p);
+      return native('delay', d, (q) => ch(q, (c) => {
+        const now = d.input.context.currentTime;
+        if (c('time')) d.delay.delayTime.setTargetAtTime(q.time, now, 0.02);
+        if (c('feedback')) d.feedback.gain.setTargetAtTime(q.feedback, now, 0.02);
+        if (c('wet')) d.mix.set(q.wet, now, 0.02);
+      }), (t, v, time) => { if (t !== 'delayFeedback') return false; d.feedback.gain.setTargetAtTime(v * 0.9, time, 0.05); return true; });
     }
     case 'pingpong': {
-      const d = new Tone.PingPongDelay({ delayTime: p.time, feedback: p.feedback, wet: p.wet, maxDelay: 2.5 });
-      return simple('pingpong', d, (q) => { d.delayTime.rampTo(q.time, 0.05); d.feedback.rampTo(q.feedback, 0.05); d.wet.rampTo(q.wet, 0.05); },
-        (t, v, time) => { if (t !== 'delayFeedback') return false; d.feedback.setTargetAtTime(v * 0.9, time, 0.05); return true; });
+      const d = new NativePingPong(Tone.getContext().rawContext as BaseAudioContext, { time: p.time, feedback: p.feedback, wet: p.wet, maxDelay: 2.5 });
+      const ch = changes(p);
+      return native('pingpong', d, (q) => ch(q, (c) => {
+        const now = d.input.context.currentTime;
+        if (c('time')) for (const x of d.delays) x.delayTime.setTargetAtTime(q.time, now, 0.02);
+        if (c('feedback')) for (const g of d.feedbacks) g.gain.setTargetAtTime(q.feedback, now, 0.02);
+        if (c('wet')) d.mix.set(q.wet, now, 0.02);
+      }), (t, v, time) => { if (t !== 'delayFeedback') return false; for (const g of d.feedbacks) g.gain.setTargetAtTime(v * 0.9, time, 0.05); return true; });
     }
     case 'reverb': {
-      const r = new Tone.Reverb({ decay: p.decay, preDelay: p.preDelay, wet: p.wet });
-      let decay = p.decay;
-      return simple('reverb', r, (q) => {
-        r.wet.rampTo(q.wet, 0.05);
-        if (Math.abs(q.decay - decay) > 0.05) { decay = q.decay; r.decay = q.decay; }
-        r.preDelay = q.preDelay;
-      }, () => false, r.ready.then(() => undefined));
+      const r = new NativeReverb(Tone.getContext().rawContext as BaseAudioContext, { decay: p.decay, preDelay: p.preDelay, wet: p.wet, seed: 3 });
+      const ch = changes(p);
+      return native('reverb', r, (q) => ch(q, (k) => {
+        if (k('wet')) r.mix.set(q.wet, r.input.context.currentTime);
+        if (k('decay') || k('preDelay')) r.setShape(q.decay, q.preDelay);
+      }));
     }
     case 'chorus': {
-      const c = new Tone.Chorus({ frequency: p.rate, depth: p.depth, delayTime: p.delay, wet: p.wet, spread: 180 }).start();
-      return simple('chorus', c, (q) => { c.frequency.rampTo(q.rate, 0.05); c.depth = q.depth; c.delayTime = q.delay; c.wet.rampTo(q.wet, 0.05); },
-        (t, v) => { if (t !== 'chorusDepth') return false; c.depth = v; return true; });
+      const c = new NativeChorus(Tone.getContext().rawContext as BaseAudioContext, { rate: p.rate, depth: p.depth, delayMs: p.delay, wet: p.wet });
+      const ch = changes(p);
+      return native('chorus', c, (q) => ch(q, (k) => {
+        const now = c.input.context.currentTime;
+        if (k('rate') || k('depth') || k('delay')) c.set({ rate: q.rate, depth: q.depth, delayMs: q.delay }, now);
+        if (k('wet')) c.mix.set(q.wet, now);
+      }), (t, v, time) => { if (t !== 'chorusDepth') return false; c.setDepth(v, time); return true; });
     }
     case 'phaser': {
-      const ph = new Tone.Phaser({ frequency: p.rate, octaves: p.octaves, baseFrequency: p.base, wet: p.wet });
-      return simple('phaser', ph, (q) => { ph.frequency.rampTo(q.rate, 0.05); ph.octaves = q.octaves; ph.baseFrequency = q.base; ph.wet.rampTo(q.wet, 0.05); });
+      const ph = new NativePhaser(Tone.getContext().rawContext as BaseAudioContext, { rate: p.rate, octaves: p.octaves, base: p.base, wet: p.wet });
+      const rates = (q: Record<string, number>) => rateFor(fc, ph.filters.flatMap(biquadParams), sweepBlockStep(q.rate, q.octaves, fc.sampleRate) <= MAX_FILTER_STEP_OCT);
+      rates(p);
+      const ch = changes(p);
+      return native('phaser', ph, (q) => ch(q, (k) => {
+        const now = ph.input.context.currentTime;
+        if (k('rate') || k('octaves') || k('base')) { ph.set({ rate: q.rate, octaves: q.octaves, base: q.base }, now); rates(q); }
+        if (k('wet')) ph.mix.set(q.wet, now);
+      }));
     }
     case 'tremolo': {
       const tr = new Tone.Tremolo({ frequency: p.rate, depth: p.depth, wet: p.wet, spread: 0 }).start();
@@ -94,8 +150,15 @@ export function createFx(slot: EffectSlot): FxUnit {
         (t, v, time) => { if (t !== 'tremoloRate') return false; tr.frequency.setTargetAtTime(0.2 + v * 14, time, 0.08); return true; });
     }
     case 'autopan': {
-      const ap = new Tone.AutoPanner({ frequency: p.rate, depth: p.depth, wet: p.wet }).start();
-      return simple('autopan', ap, (q) => { ap.frequency.rampTo(q.rate, 0.05); ap.depth.rampTo(q.depth, 0.05); ap.wet.rampTo(q.wet, 0.05); });
+      const ap = new NativeAutoPanner(Tone.getContext().rawContext as BaseAudioContext, { rate: p.rate, depth: p.depth, wet: p.wet });
+      const rates = (q: Record<string, number>) => rateFor(fc, [ap.panner.pan], lfoBlockStep(q.rate, q.depth, fc.sampleRate) <= MAX_PAN_STEP);
+      rates(p);
+      const ch = changes(p);
+      return native('autopan', ap, (q) => ch(q, (k) => {
+        const now = ap.input.context.currentTime;
+        if (k('rate') || k('depth')) { ap.set({ rate: q.rate, depth: q.depth }, now); rates(q); }
+        if (k('wet')) ap.mix.set(q.wet, now);
+      }));
     }
     case 'filter': {
       const f = new Tone.Filter({ type: FILTER_MODES[Math.round(p.mode)] ?? 'lowpass', frequency: p.cutoff, Q: p.res, rolloff: -24 });
@@ -137,47 +200,69 @@ export function createFx(slot: EffectSlot): FxUnit {
       return simple('limiter', c, (q) => { c.threshold.value = q.threshold; });
     }
     case 'atmosSweep':
-      return createAtmosSweep(p);
+      return createAtmosSweep(p, fc);
   }
 }
 
 /** Atmospheric Sweep: slow stereo auto-pan → modulated phase + chorus → large diffuse reverb with
- *  feedback ambience → sweeping tonal filter, blended behind the clean signal. Original configuration
- *  built from stock Tone.js nodes. */
-function createAtmosSweep(p: Record<string, number>): FxUnit {
-  const input = new Tone.Gain();
-  const xf = new Tone.CrossFade(p.mix);
-  const pan = new Tone.AutoPanner({ frequency: p.speed * 0.5, depth: p.spread, wet: 1 }).start();
-  const phaser = new Tone.Phaser({ frequency: p.speed, octaves: 1 + p.depth * 4, baseFrequency: 280, wet: 0.6 });
-  const chorus = new Tone.Chorus({ frequency: p.speed * 3, depth: 0.4 + p.depth * 0.6, delayTime: 6, wet: 0.6, spread: 180 }).start();
-  const fb = new Tone.FeedbackDelay({ delayTime: 0.61, feedback: p.feedback, wet: 0.35, maxDelay: 1.5 });
-  const verb = new Tone.Reverb({ decay: p.size, preDelay: 0.04, wet: 0.85 });
-  const sweep = new Tone.AutoFilter({ frequency: p.speed * 0.7, octaves: 1 + p.filterMove * 4.5, baseFrequency: 180, wet: 1, filter: { type: 'lowpass', rolloff: -12, Q: 1.5 } }).start();
-  const wetTrim = new Tone.Gain(1.4);
-  input.connect(xf.a);
-  input.chain(pan, phaser, chorus, fb, verb, sweep, wetTrim, xf.b);
-  let size = p.size;
-  const nodes = [input, xf, pan, phaser, chorus, fb, verb, sweep, wetTrim];
+ *  feedback ambience → sweeping tonal filter, blended behind the clean signal. The modulation and
+ *  delay stages are the native equivalents of the Tone.js effects it was designed with (same
+ *  mapping, verified against them); the reverb is Tone.Reverb's impulse (nativeFx.ts). */
+function createAtmosSweep(p: Record<string, number>, fc: FxContext): FxUnit {
+  const ctx = Tone.getContext().rawContext as BaseAudioContext;
+  const input = ctx.createGain();
+  const xf = new DryWet(ctx, p.mix);
+  const pan = new NativeAutoPanner(ctx, { rate: p.speed * 0.5, depth: p.spread, wet: 1 });
+  const phaser = new NativePhaser(ctx, { rate: p.speed, octaves: 1 + p.depth * 4, base: 280, wet: 0.6 });
+  const chorus = new NativeChorus(ctx, { rate: p.speed * 3, depth: 0.4 + p.depth * 0.6, delayMs: 6, wet: 0.6 });
+  const fb = new NativeFeedbackDelay(ctx, { time: 0.61, feedback: p.feedback, wet: 0.35, maxDelay: 1.5 });
+  const verb = new NativeReverb(ctx, { decay: p.size, preDelay: 0.04, wet: 0.85, seed: 2 });
+  const sweep = new NativeAutoFilter(ctx, { rate: p.speed * 0.7, octaves: 1 + p.filterMove * 4.5, base: 180, q: 1.5, wet: 1 });
+  const wetTrim = ctx.createGain();
+  wetTrim.gain.value = 1.4;
+  input.connect(xf.dry);
+  input.connect(pan.input);
+  pan.output.connect(phaser.input);
+  phaser.output.connect(chorus.input);
+  chorus.output.connect(fb.input);
+  fb.output.connect(verb.input);
+  verb.output.connect(sweep.input);
+  sweep.output.connect(wetTrim).connect(xf.wet);
+  // the three slow sweeps (well under 1 Hz) may run at block rate; the chorus delay sweep may not
+  // (a stepped delay time jumps the read position several samples per block)
+  const rates = (q: Record<string, number>) => {
+    rateFor(fc, phaser.filters.flatMap(biquadParams), sweepBlockStep(q.speed, 1 + q.depth * 4, fc.sampleRate) <= MAX_FILTER_STEP_OCT);
+    rateFor(fc, biquadParams(sweep.filter), sweepBlockStep(q.speed * 0.7, 1 + q.filterMove * 4.5, fc.sampleRate) <= MAX_FILTER_STEP_OCT);
+    rateFor(fc, [pan.panner.pan], lfoBlockStep(q.speed * 0.5, q.spread, fc.sampleRate) <= MAX_PAN_STEP);
+  };
+  rates(p);
+  const ch = changes(p);
   return {
-    type: 'atmosSweep', input, output: xf, ready: verb.ready.then(() => undefined),
-    set: (q) => {
-      xf.fade.rampTo(q.mix, 0.1);
-      pan.frequency.rampTo(q.speed * 0.5, 0.1);
-      pan.depth.rampTo(q.spread, 0.1);
-      phaser.frequency.rampTo(q.speed, 0.1);
-      phaser.octaves = 1 + q.depth * 4;
-      chorus.frequency.rampTo(q.speed * 3, 0.1);
-      chorus.depth = 0.4 + q.depth * 0.6;
-      fb.feedback.rampTo(q.feedback, 0.1);
-      sweep.frequency.rampTo(q.speed * 0.7, 0.1);
-      sweep.octaves = 1 + q.filterMove * 4.5;
-      if (Math.abs(q.size - size) > 0.1) { size = q.size; verb.decay = q.size; }
-    },
+    type: 'atmosSweep', input, output: xf.output, ready: Promise.resolve(),
+    set: (q) => ch(q, (k) => {
+      const now = ctx.currentTime;
+      if (k('mix')) xf.set(q.mix, now, 0.03);
+      if (k('speed') || k('spread')) pan.set({ rate: q.speed * 0.5, depth: q.spread }, now);
+      if (k('speed') || k('depth')) {
+        phaser.set({ rate: q.speed, octaves: 1 + q.depth * 4, base: 280 }, now);
+        chorus.set({ rate: q.speed * 3, depth: 0.4 + q.depth * 0.6, delayMs: 6 }, now);
+      }
+      if (k('feedback')) fb.feedback.gain.setTargetAtTime(q.feedback, now, 0.03);
+      if (k('speed') || k('filterMove')) sweep.set({ rate: q.speed * 0.7, octaves: 1 + q.filterMove * 4.5, base: 180 }, now);
+      if (k('size')) verb.setShape(q.size, 0.04);
+      rates(q);
+    }),
     mod: (t, v, time) => {
-      if (t === 'sweepDepth') { xf.fade.setTargetAtTime(v, time, 0.1); return true; }
-      if (t === 'delayFeedback') { fb.feedback.setTargetAtTime(v * 0.85, time, 0.1); return true; }
+      if (t === 'sweepDepth') { xf.set(v, time, 0.1); return true; }
+      if (t === 'delayFeedback') { fb.feedback.gain.setTargetAtTime(v * 0.85, time, 0.1); return true; }
       return false;
     },
-    dispose: () => nodes.forEach((n) => n.dispose()),
+    dispose: () => {
+      for (const x of [pan, phaser, chorus, fb, sweep]) x.dispose();
+      verb.dispose();
+      input.disconnect();
+      wetTrim.disconnect();
+      xf.disconnect();
+    },
   };
 }

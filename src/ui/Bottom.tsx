@@ -6,6 +6,7 @@ import { allowedPitches, DRUM_NAMES, inScale, midiName } from '../theory/scales'
 import { dbToGain } from '../audio/voices';
 import { hexA, useStageCanvas } from './canvas';
 import { IChevron } from './components/icons';
+import { PerfMonitor } from './panels/PerfMonitor';
 
 // ------------------------------------------------------------------ timeline
 
@@ -347,8 +348,8 @@ export function Bottom() {
       <Timeline />
       <div className="bottom-bar">
         <div className="tabs" role="tablist" style={{ borderBottom: 0, padding: 0 }}>
-          {(['mixer', 'roll', 'scenes'] as const).map((k) => (
-            <button key={k} role="tab" className="tab" aria-selected={ui.bottomTab === k} onClick={() => st.setUi({ bottomTab: k, bottomOpen: true })}>{k === 'roll' ? 'Piano roll' : k === 'mixer' ? 'Mixer' : 'Scenes'}</button>
+          {(['mixer', 'roll', 'scenes', 'perf'] as const).map((k) => (
+            <button key={k} role="tab" className="tab" aria-selected={ui.bottomTab === k} onClick={() => st.setUi({ bottomTab: k, bottomOpen: true })}>{k === 'roll' ? 'Piano roll' : k === 'mixer' ? 'Mixer' : k === 'perf' ? 'Performance' : 'Scenes'}</button>
           ))}
         </div>
         {ui.pendingRegen && <span className="note warn" style={{ margin: 0 }}>⏱ {ui.pendingRegen}</span>}
@@ -357,7 +358,7 @@ export function Bottom() {
         <button className="btn small icon" aria-label={ui.bottomOpen ? 'Collapse panel' : 'Expand panel'} aria-expanded={ui.bottomOpen} onClick={() => st.setUi({ bottomOpen: !ui.bottomOpen })} style={{ transform: ui.bottomOpen ? undefined : 'rotate(180deg)' }}><IChevron size={14} /></button>
       </div>
       <div className="bottom-body">
-        {ui.bottomTab === 'mixer' ? <Mixer /> : ui.bottomTab === 'roll' ? <PianoRoll /> : <Scenes />}
+        {ui.bottomTab === 'mixer' ? <Mixer /> : ui.bottomTab === 'roll' ? <PianoRoll /> : ui.bottomTab === 'perf' ? <PerfMonitor /> : <Scenes />}
       </div>
     </section>
   );

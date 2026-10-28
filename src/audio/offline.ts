@@ -6,6 +6,7 @@
 import * as Tone from 'tone';
 import type { Project } from '../core/types';
 import { AudioGraph, laneValue } from './graph';
+import { type AudioQuality, QUALITY } from './quality';
 import { chaseNotes, eventsInWindow } from './schedule';
 
 export interface RenderOptions {
@@ -17,6 +18,12 @@ export interface RenderOptions {
   sampleRate?: number;
   onProgress?: (f: number) => void;
   signal?: AbortSignal;
+  /** processing profile; exports default to High quality (no realtime deadline offline) */
+  quality?: AudioQuality;
+  /** override the profile's voice budget (tests use a small one to exercise voice stealing) */
+  voiceBudget?: number;
+  /** diagnostics: called with the render graph before scheduling (taps, meters) */
+  onGraph?: (g: AudioGraph, ctx: OfflineAudioContext) => void;
 }
 
 export class RenderCancelled extends Error { constructor() { super('Render cancelled'); } }
@@ -40,12 +47,14 @@ export async function renderOffline(project: Project, o: RenderOptions): Promise
     ? { ...project, tracks: project.tracks.map((t) => ({ ...t, mix: { ...t.mix, mute: !only.has(t.id), solo: false } })) }
     : project;
   try {
-    graph = new AudioGraph(false);
+    const profile = QUALITY[o.quality ?? 'high'];
+    graph = new AudioGraph(false, o.voiceBudget !== undefined ? { ...profile, voiceBudget: o.voiceBudget } : profile);
     graph.sync(p);
   } finally {
     Tone.setContext(prev);
   }
   await graph.whenReady();
+  o.onGraph?.(graph, raw);
 
   const timeOf = (beat: number) => (beat - o.from) / bps;
   const scheduleChunk = (t0: number, t1: number) => {

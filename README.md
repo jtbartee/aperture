@@ -59,10 +59,13 @@ On macOS you can double-click **Launch APERTURE.command** (serves the build on p
 
 ### Tests
 ```bash
-npm test           # 136 unit tests (musical acceptance A–K, theory, contour fidelity, sonification, drawing, image, panorama, composer, scheduler, MIDI parity, files)
+npm test           # 150 unit tests (musical acceptance A–K, theory, contour fidelity, sonification, drawing, image, panorama, composer, scheduler, MIDI parity, files, audio performance)
 npm run build && npm run e2e            # end-to-end checks in headless Chromium
 npm run e2e -- draw synth image panorama generative export factory ui audio sonify musical   # any subset
+npm run stress                          # high-polyphony audio stress test (Drone / Experimental + photo + MOD routes)
+HEADFUL=1 CHROME_PATH="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" SCALE=2 npm run stress   # + real output underruns
 ```
+`npm run stress` checks that the native effects match their Tone.js originals sample-for-sample, audits offline renders (clipping, isolated clicks, reproducibility), schedules live without late, duplicated or missing notes, leaks no audio nodes across playbacks, switches processing profile and project while playing, and exercises the voice budget. Headless Chrome's fake audio sink never underruns, so dropouts are only measured with `HEADFUL=1` (it opens a window, silences the app's output and reads the browser's `playbackStats`); `SCALE=k` multiplies every layer to find the breaking point.
 `npm run e2e -- musical` drives the Harmony tab, Orbital voices and Particle zones through the UI, runs the full remove → undo → keep-music → save/reload → replace → clear → export flow for images and panoramas, and renders ten listening demos (C major C–Am–F–G, D Dorian dub, A minor pentatonic minimal, F minor blues, IDM in E minor Strict and Experimental, free-time ambient, 5/4 and 7/8, Orbital + Particles) to `tests/e2e/out/listening/musical/` with a note-level and audio report (`report.txt`, `report.json`). `DEMOS=A,F npm run e2e -- musical` renders only those.
 `npm run e2e -- sonify` renders the musical evaluation through the real audio engine: silence for an empty image, rendered onsets of irregular bars, spectral contrast between photographs, zone-by-zone change across a panorama, and five listening demos (WAV + spectrogram) in `tests/e2e/out/listening/` with measurements in `report.txt`.
 The end-to-end suite needs `playwright-core` (a dev dependency) and a Chromium. It looks for the Playwright-cached Chrome for Testing; set `CHROME_PATH` to use another. It verifies audio by **measuring** it — live analyser RMS, offline renders, decoded WAV files, click and clipping audits — not by trusting DOM state.
@@ -104,7 +107,8 @@ PRESENTATION React + Canvas 2D                              src/ui/
 
 Key decisions:
 - **One event model.** Live playback, offline rendering and MIDI export all read the same `NoteEvent[]` through `eventsInWindow()`; swing is a single continuous time-warp applied identically everywhere. The MIDI parity test checks this tick-for-tick.
-- **Voices are built per note from native Web Audio nodes**, so every synth parameter is real, works the same in an `OfflineAudioContext`, and nothing can stick: every source gets an explicit stop time. Tone.js supplies effects and the offline context.
+- **Voices are built per note from native Web Audio nodes**, so every synth parameter is real, works the same in an `OfflineAudioContext`, and nothing can stick: every source gets an explicit stop time. The live context wraps a *native* `AudioContext`; modulation effects, delays and reverbs are native too (`src/audio/nativeFx.ts`, verified sample-for-sample against the Tone.js effects they replace); Tone.js supplies gains, panners, compressors, meters and the offline context.
+- **Realtime cost is budgeted** (`src/audio/quality.ts`): slow modulation (LFO sweeps, lane automation, slow envelopes) runs once per 128-sample block where the step is provably inaudible, reverb impulses stop at −90 dB, a cost-weighted project-wide voice budget takes release tails before anything else, and the output buffer is sized for playback. Three profiles — Balanced, High quality, Performance — live in the **Performance** tab with the monitor; they never change notes.
 - **Scheduling** is a 25 ms timer looking 120 ms ahead on the audio clock; the cursor only moves forward, so nothing is scheduled twice. Loop wraps and tempo changes append clock segments; the playhead is derived from the audio clock.
 - **Image analysis** is tiled: the full-resolution bitmap is cut into tiles, each downscaled and sent to a worker, which builds a compact feature grid (per cell: light, colour, contrast, gradient energy and an edge-magnitude histogram; per column: edge profile and periodicity) and traces contours. Musical regeneration, scale/sound changes and panorama regions only read that cache; a contour-setting change re-runs just the contour stage.
 - **Contours are geometry, not buckets** (`src/analysis/contours.ts`): multi-scale Canny with a noise-relative and an absolute threshold → near-parallel edges merged into centrelines → Zhang–Suen skeleton → a pixel graph of endpoints, junction clusters and segments → spur pruning → chains joined by good continuation through junctions (so crossing lines stay separate) → gap bridging → curvature-aware smoothing → Douglas–Peucker that keeps corners. Paths are x-split only at sonification time, so loops and lines that double back play as simultaneous lines.
@@ -116,7 +120,8 @@ Key decisions:
 
 ## Troubleshooting
 
-- **No sound** — click anywhere first (browsers require a gesture before audio). Check that the layer isn't muted and that another layer isn't soloed.
+- **No sound** — click anywhere first (browsers require a gesture before audio). Check that the layer isn't muted and that another layer isn't soloed. A MOD route to *Level* at depth ≥ 0.5 silences a layer wherever its image feature is near zero.
+- **Crackles or dropouts in a dense project** — open the **Performance** tab while it plays. *Underruns* (Chrome 156+) means the audio thread missed its deadline: switch to the *Performance* profile, or remove an Atmospheric Sweep/Reverb insert you don't need (each convolution reverb is the most expensive thing in the mix). *Late notes* means the page was busy for more than 120 ms. Hard limiting is reported separately.
 - **A huge panorama won't import** — the browser could not decode it, or it exceeds the 150 MP safety limit. Export it as a JPG under ~20 000 px wide.
 - **Projects disappeared** — browser storage was cleared. Keep `.aperture` project files for anything you care about.
 - **MIDI keyboard not detected** — Web MIDI needs Chrome or Edge; press the record button to request access. Everything else works without MIDI.

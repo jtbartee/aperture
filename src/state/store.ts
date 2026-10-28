@@ -38,7 +38,7 @@ export interface UIState {
   selNotes: string[]; // note ids on the selected track
   showNotes: boolean;
   inspectorTab: 'track' | 'sound' | 'fx' | 'source' | 'mod' | 'harmony';
-  bottomTab: 'mixer' | 'roll' | 'scenes';
+  bottomTab: 'mixer' | 'roll' | 'scenes' | 'perf';
   bottomOpen: boolean;
   leftOpen: boolean;
   rightOpen: boolean;

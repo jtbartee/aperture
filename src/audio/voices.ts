@@ -5,14 +5,20 @@
 
 import type { DrumVoice, SynthPatch } from '../core/types';
 import { defaultImageParams } from './imageSynth';
+import { BLOCK, MAX_FILTER_STEP_OCT, MAX_PITCH_STEP_CENTS, biquadParams, blockRate, lfoBlockStep } from './quality';
 
 export interface Voice {
   start: number;
   /** scheduled end of the audible tail (Infinity while a held note is down) */
   end: number;
+  /** when the gate closes (the release stage starts); Infinity while held */
+  gateOff: number;
   midi: number;
+  /** estimated rendering cost (voiceCost) for the global voice budget */
+  cost: number;
   release(t: number): void;
-  kill(t: number): void;
+  /** fade out over `fade` seconds (default 15 ms) and stop */
+  kill(t: number, fade?: number): void;
 }
 
 /** Channel modulation buses an Image Synth voice listens to while it sounds (audio/graph.ts). */
@@ -36,6 +42,10 @@ export interface VoiceOpts {
   bendOffset?: number;
   /** live modulation sources; absent = static patch values */
   bus?: (name: BusName) => AudioNode | null;
+  /** compute slow modulation at block rate where the step is inaudible (audio/quality.ts) */
+  blockRate?: boolean;
+  /** the largest Image Synth LFO rate (Hz) and depth (0..1) the channel's lanes can reach */
+  lfoMax?: { rate: number; depth: number };
 }
 
 const noiseBuffers = new WeakMap<BaseAudioContext, AudioBuffer>();
@@ -85,6 +95,64 @@ interface Built {
   onRelease: (t: number) => number;
   /** earliest time a release may start (end of attack) */
   attackEnd: number;
+  /** undo connections from long-lived nodes (channel buses) once the voice has finished */
+  detach?: () => void;
+}
+
+/** Octaves per second of an exponential approach (setTargetAtTime) that falls `octaves` with time
+ *  constant `tau`: its steepest point, in the log domain. */
+const approachRate = (octaves: number, tau: number) => (1 - Math.pow(2, -Math.max(0, octaves))) / Math.max(1e-4, tau) / Math.LN2;
+
+/** Whether a voice filter's movement (envelope + LFO wobble, in octaves) is slow enough for block rate. */
+function filterIsSlow(ctx: BaseAudioContext, p: SynthPatch, wobble: { rate: number; octaves: number }): boolean {
+  const bs = BLOCK / ctx.sampleRate;
+  const amt = p.filter.envAmt > 0.01 ? p.filter.envAmt : 0;
+  const env = Math.max(
+    (amt / Math.max(0.002, p.fenv.a)) * bs,
+    approachRate(amt * (1 - p.fenv.s), Math.max(0.005, p.fenv.d / 4)) * bs,
+    approachRate(amt * p.fenv.s, Math.max(0.005, p.fenv.r / 4)) * bs,
+  );
+  return env <= MAX_FILTER_STEP_OCT && lfoBlockStep(wobble.rate, wobble.octaves, ctx.sampleRate) <= MAX_FILTER_STEP_OCT;
+}
+
+/** Whether pitch movement on the oscillators' detune (vibrato, contour bends) is slow enough for block rate. */
+function pitchIsSlow(ctx: BaseAudioContext, p: SynthPatch, o: VoiceOpts): boolean {
+  const bs = BLOCK / ctx.sampleRate;
+  if (p.lfo.dest === 'pitch' && p.lfo.depth > 0 && lfoBlockStep(p.lfo.rate, p.lfo.depth * 100, ctx.sampleRate) > MAX_PITCH_STEP_CENTS) return false;
+  const b = o.bend;
+  if (b && b.length > 1) {
+    const spb = o.spb ?? 0.5;
+    for (let i = 1; i < b.length; i++) {
+      const cps = (Math.abs(b[i][1] - b[i - 1][1]) * 100) / Math.max(1e-6, (b[i][0] - b[i - 1][0]) * spb);
+      if (cps * bs > MAX_PITCH_STEP_CENTS) return false;
+    }
+  }
+  return true;
+}
+
+/** Relative rendering cost of one voice of a patch, in units of roughly one plain oscillator.
+ *  Weights follow offline measurements: an oscillator or filter with audio-rate parameter input
+ *  costs ~4–6× a static one. Used by the global voice budget (AudioGraph.trigger). */
+export function voiceCost(p: SynthPatch, blockRateOn = false): number {
+  const filt = (moving: boolean) => (moving && !blockRateOn ? 5 : 1.5);
+  const movingFilter = p.filter.envAmt > 0.01 || p.lfo.dest === 'filter';
+  switch (p.engine) {
+    case 'fm': {
+      const u = Math.max(1, Math.min(4, Math.round(p.unison)));
+      return 1 + u * 3 + (p.noise > 0.001 ? 1 : 0) + (p.lfo.dest !== 'none' ? 1 : 0) + filt(movingFilter) + 1;
+    }
+    case 'modal': return p.modal.ratios.length * 1.4 + (p.modal.strike > 0 ? 2 : 0) + 2;
+    case 'image': return 2 * 4 + 1 + 1.5 + 1 + filt(true) + 3;
+    case 'noise': return 1 + filt(movingFilter) + 0.5;
+    case 'glitch': return 3;
+    case 'drums': return 4;
+    default: {
+      const u = Math.max(1, Math.min(6, Math.round(p.unison)));
+      const oscs = (p.osc1.level > 0.001 ? u : 0) + (p.osc2.level > 0.001 ? u : 0) + (p.sub > 0.001 ? 1 : 0);
+      const vib = p.lfo.dest === 'pitch' && p.lfo.depth > 0 && !blockRateOn ? 3 : 1;
+      return oscs * vib + (p.noise > 0.001 ? 1 : 0) + (p.lfo.dest !== 'none' ? 1 : 0) + filt(movingFilter) + 1;
+    }
+  }
 }
 
 /** Linear attack to `peak`, then exponential decay to the sustain level. When the gate closes
@@ -163,10 +231,17 @@ function buildSub(ctx: BaseAudioContext, p: SynthPatch, midi: number, vel: numbe
 function finishChain(
   ctx: BaseAudioContext, p: SynthPatch, midi: number, vel: number, t: number, src: AudioNode,
   sources: AudioScheduledSourceNode[], pitchTargets: OscillatorNode[], out: AudioNode, o: VoiceOpts, gateOff?: number,
+  wobble?: { rate: number; octaves: number },
 ): Built {
   const nyq = ctx.sampleRate * 0.45;
   if (o.attack !== undefined || o.release !== undefined) p = { ...p, amp: { ...p.amp, a: o.attack ?? p.amp.a, r: o.release ?? p.amp.r } };
   const filter = ctx.createBiquadFilter();
+  if (o.blockRate) {
+    const lfoWob = p.lfo.dest === 'filter' ? { rate: p.lfo.rate, octaves: p.lfo.depth * 2 } : { rate: 0, octaves: 0 };
+    const w = wobble ?? lfoWob;
+    if (filterIsSlow(ctx, p, w)) blockRate(...biquadParams(filter));
+    if (pitchIsSlow(ctx, p, o)) blockRate(...pitchTargets.map((x) => x.detune));
+  }
   filter.type = p.filter.type;
   filter.Q.value = Math.max(0.0001, p.filter.res);
   const base = Math.min(nyq, Math.max(20, p.filter.cutoff * Math.pow(2, (p.filter.keyTrack * (midi - 60)) / 12) * (o.cutoffMul ?? 1)));
@@ -356,7 +431,17 @@ function buildImage(ctx: BaseAudioContext, p: SynthPatch, midi: number, vel: num
   const f = mtof(midi);
   const nyq = ctx.sampleRate * 0.45;
   const sources: AudioScheduledSourceNode[] = [];
-  const bus = (n: BusName) => o.bus?.(n) ?? null;
+  // each bus reaches this voice through its own tap, disconnected when the voice ends: a bus is a
+  // running source, so a direct connection would keep every finished voice's nodes alive forever
+  const taps: [AudioNode, GainNode][] = [];
+  const bus = (n: BusName) => {
+    const b = o.bus?.(n);
+    if (!b) return null;
+    const tap = ctx.createGain();
+    b.connect(tap);
+    taps.push([b, tap]);
+    return tap;
+  };
   const scaled = (src: AudioNode, k: number, dest: AudioParam) => { const g = ctx.createGain(); g.gain.value = k; src.connect(g).connect(dest); };
   // keep every partial AND its FM sidebands below Nyquist (≈ (index + 1) · ratio · f either side
   // of each harmonic, at the bus's maximum index of 3) — aliased FM grit sounds like clicks
@@ -421,6 +506,8 @@ function buildImage(ctx: BaseAudioContext, p: SynthPatch, midi: number, vel: num
   const mRate = bus('lfoRate');
   if (mRate) { lfo.frequency.value = 0; mRate.connect(lfo.frequency); }
   else lfo.frequency.value = ip.lfoRate;
+  // a stepped LFO *rate* keeps the phase continuous, so this is always safe at block rate
+  if (o.blockRate) blockRate(lfo.frequency);
   const trem = ctx.createGain();
   const tremDepth = ctx.createGain();
   const mTrem = bus('tremolo');
@@ -429,7 +516,10 @@ function buildImage(ctx: BaseAudioContext, p: SynthPatch, midi: number, vel: num
   lfo.connect(tremDepth).connect(trem.gain);
   mix.connect(trem);
   for (const src of [oscA, oscB, mod, nz, lfo]) { src.start(t); sources.push(src); }
-  const built = finishChain(ctx, p, midi, vel, t, trem, sources, [oscA, oscB, mod], out, { ...o, cutoffMul: (o.cutoffMul ?? 1) * Math.pow(2, ((o.timbre ?? 0.5) - 0.5) * 1.2) }, gateOff);
+  // the wobble's worst case: the larger of the patch value and anything the channel's lanes reach
+  const wobble = { rate: Math.max(ip.lfoRate, o.lfoMax?.rate ?? 0), octaves: Math.max(ip.lfoDepth, o.lfoMax?.depth ?? 0) };
+  const built = finishChain(ctx, p, midi, vel, t, trem, sources, [oscA, oscB, mod], out, { ...o, cutoffMul: (o.cutoffMul ?? 1) * Math.pow(2, ((o.timbre ?? 0.5) - 0.5) * 1.2) }, gateOff, wobble);
+  built.detach = () => { for (const [b, tap] of taps) { try { b.disconnect(tap); } catch { /* already gone */ } } };
   const wob = ctx.createGain();
   const mDepth = bus('lfoDepth');
   if (mDepth) { wob.gain.value = 0; scaled(mDepth, 1200, wob.gain); }
@@ -694,29 +784,37 @@ export function startVoice(ctx: BaseAudioContext, out: AudioNode, p: SynthPatch,
   const stopAll = (t: number) => {
     for (const s of b.sources) { try { s.stop(t); } catch { /* already stopped */ } }
   };
+  let killedAt = Infinity;
   const v: Voice = {
     start: time,
     end: Infinity,
+    gateOff: Infinity,
     midi,
+    cost: voiceCost(p, !!o.blockRate),
     release(t: number) {
       if (v.end !== Infinity) return;
       const tOff = gateOff ?? Math.max(t, b.attackEnd);
       const tail = b.onRelease(tOff);
+      v.gateOff = tOff;
       v.end = tOff + tail;
       stopAll(v.end + 0.02);
     },
-    kill(t: number) {
+    kill(t: number, fade = 0.015) {
       const at = Math.max(t, time);
+      if (at >= killedAt) return; // already fading out earlier
+      killedAt = at;
+      kill.gain.cancelScheduledValues(at);
       kill.gain.setValueAtTime(1, at);
-      kill.gain.linearRampToValueAtTime(0, at + 0.015);
-      stopAll(at + 0.03);
-      v.end = Math.min(v.end, at + 0.03);
+      kill.gain.linearRampToValueAtTime(0, at + fade);
+      stopAll(at + fade + 0.015);
+      v.end = Math.min(v.end, at + fade + 0.015);
+      v.gateOff = Math.min(v.gateOff, at);
     },
   };
   // disconnect everything once the last source ends (lets the GC collect the graph)
   let alive = b.sources.length;
   for (const s of b.sources) {
-    s.onended = () => { if (--alive === 0) { try { kill.disconnect(); } catch { /* ignore */ } } };
+    s.onended = () => { if (--alive === 0) { try { kill.disconnect(); } catch { /* ignore */ } b.detach?.(); } };
   }
   if (gateOff !== undefined || p.engine === 'drums' || p.engine === 'glitch') v.release(gateOff ?? time);
   return v;

@@ -21,6 +21,7 @@ import { Dialogs } from './Dialogs';
 import { ErrorBoundary } from './ErrorBoundary';
 import { loadFactory } from '../state/factory';
 import { renderOffline, peakAndRms } from '../audio/offline';
+import * as nativeFx from '../audio/nativeFx';
 import { projectToMidi } from '../export/midi';
 import { INSTRUMENTS, instrument } from '../audio/patches';
 import { getAnalysis, getLevels } from '../analysis/client';
@@ -63,7 +64,7 @@ export function App() {
       api: {
         renderOffline, peakAndRms, projectToMidi, INSTRUMENTS, instrument, getAnalysis, getLevels, scanPoint, displayBeats, darkUniform, colorfulTexture, rgbaToPng,
         hazeImage, ridgesImage, irregularBars, uniformImage, contourFixture, panoramaLandscape, contourPreset, encodeWav,
-        listAssetIds: db.listAssetIds, projectContext, explain, slotAt, chordSymbol, pcName,
+        listAssetIds: db.listAssetIds, projectContext, explain, slotAt, chordSymbol, pcName, nativeFx,
       },
       liveRms: () => {
         const a = engine.graph?.analyser;
