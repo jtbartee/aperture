@@ -31,11 +31,14 @@ export function ShapeControls<T extends Shaped>({ s, set }: { s: T; set: (patch:
         <Check label="Continuous pitch (glide)" title="Contour notes bend with the shape; microtonal when musical structure is below 20 %" checked={s.glide} onChange={(v) => set({ glide: v } as Partial<T>, true)} />
         <Check label="Scale lock" title="Off = chromatic pitch rows" checked={s.scaleLock} onChange={(v) => set({ scaleLock: v } as Partial<T>, true)} />
       </div>
-      <Seg label="Rhythm" value={s.rhythm} onChange={(v: RhythmMode) => set({ rhythm: v } as Partial<T>, true)} options={[
-        { value: 'free', label: 'Free time', title: 'Events sit where the image changes: contour starts, junctions, extrema, colour and light boundaries' },
-        { value: 'texture', label: 'Image texture', title: 'Micro-events at the peaks of the image’s edge profile: clicks, grains, accents and pulses from repeated structure' },
-        { value: 'metric', label: 'Metric beat', title: 'The conventional sixteenth-grid drum engine (explicit opt-in)' },
-      ]} />
+      <h3 className="h">Rhythm</h3>
+      <div className="seg-full">
+        <Seg value={s.rhythm} onChange={(v: RhythmMode) => set({ rhythm: v } as Partial<T>, true)} label="Rhythm" options={[
+          { value: 'free', label: 'Free time', title: 'Events sit where the image changes: contour starts, junctions, extrema, colour and light boundaries' },
+          { value: 'texture', label: 'Image texture', title: 'Micro-events at the peaks of the image’s edge profile: clicks, grains, accents and pulses from repeated structure' },
+          { value: 'metric', label: 'Metric beat', title: 'The conventional sixteenth-grid drum engine (explicit opt-in)' },
+        ]} />
+      </div>
       <p className="note">{({
         free: 'Free time: no drum kit, no metrical pulse. The tempo only organises the transport and export.',
         texture: 'Image texture: rhythmic activity placed by the image’s own detail — dense regions cluster, smooth regions stay sparse, repeated structures pulse.',
@@ -89,9 +92,9 @@ export function SynthControls<T extends Shaped>({ s, set }: { s: T; set: (patch:
           <table className="grid synthmap"><tbody>
             {map.map((m, i) => (
               <tr key={`${m.target}_${i}`}>
-                <td style={{ width: 118 }} title={SYNTH_TARGETS[m.target].kind === 'note' ? 'Read at each note onset' : SYNTH_TARGETS[m.target].kind === 'gen' ? 'Shapes where events are placed' : 'Continuous automation'}>{SYNTH_TARGETS[m.target].label}</td>
+                <td className="tgt" title={SYNTH_TARGETS[m.target].kind === 'note' ? 'Read at each note onset' : SYNTH_TARGETS[m.target].kind === 'gen' ? 'Shapes where events are placed' : 'Continuous automation'}>{SYNTH_TARGETS[m.target].label}</td>
                 <td><Select ariaLabel={`${SYNTH_TARGETS[m.target].label} source`} value={m.source} options={feat} onChange={(v: FeatureKey) => setMap(map.map((x, j) => (j === i ? { ...x, source: v } : x)))} /></td>
-                <td style={{ width: 70 }}><input type="range" aria-label={`${SYNTH_TARGETS[m.target].label} amount`} min={-1} max={1} step={0.05} value={m.amount}
+                <td style={{ width: 58 }}><input type="range" aria-label={`${SYNTH_TARGETS[m.target].label} amount`} min={-1} max={1} step={0.05} value={m.amount}
                   onPointerDown={st.checkpoint} onChange={(e) => setMap(map.map((x, j) => (j === i ? { ...x, amount: Number(e.target.value) } : x)), false)} onPointerUp={() => setMap(map)} onKeyUp={() => setMap(map)} title={`amount ${m.amount.toFixed(2)}`} /></td>
                 <td style={{ width: 22 }}><button className="btn small icon" aria-label={`Remove ${SYNTH_TARGETS[m.target].label} mapping`} onClick={() => setMap(map.filter((_, j) => j !== i))}>×</button></td>
               </tr>

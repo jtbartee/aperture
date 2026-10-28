@@ -208,3 +208,12 @@ table.synthmap td { padding: 2px 3px; vertical-align: middle; font-size: 11px; }
 table.synthmap input[type=range] { width: 100%; }
 .harm { display: flex; align-items: flex-end; gap: 1px; height: 28px; flex: 1; min-width: 0; }
 .harm span { flex: 1; min-width: 1px; border-radius: 1px 1px 0 0; }
+.seg-full .row { grid-template-columns: 1fr; }
+.seg-full .row > .lbl { display: none; }
+.seg-full .seg { display: flex; width: 100%; }
+.seg-full .seg button { flex: 1; white-space: nowrap; }
+table.synthmap { width: 100%; table-layout: fixed; }
+table.synthmap td.tgt { width: 96px; line-height: 1.2; }
+table.synthmap td:nth-child(2) { width: auto; }
+table.synthmap td:nth-child(4) { width: 24px; }
+table.synthmap .sel { width: 100%; min-width: 0; }

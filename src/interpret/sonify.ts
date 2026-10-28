@@ -145,7 +145,7 @@ export function contourCount(total: number, density: number): number {
   return Math.max(1, Math.min(total, Math.ceil(total * (0.15 + 0.85 * Math.pow(c01(density), 1.2)))));
 }
 
-interface Draft { start: number; end: number; y: number; ys: number[]; s: number; k: number; x: number; bend?: [number, number][]; accent?: boolean; cid: string }
+interface Draft { start: number; end: number; y: number; ys: number[]; s: number; k: number; x: number; bend?: [number, number][]; accent?: boolean; cid: string; opens?: boolean }
 
 /** Notes for a set of contours (one musical voice). */
 export function contourVoice(i: VoiceInput): NoteEvent[] {
@@ -232,9 +232,9 @@ export function contourVoice(i: VoiceInput): NoteEvent[] {
           const kN = c01(d.k * 6);
           const gate = lerp(lerp(0.96, 0.62, kN), 1.02, W);
           const vel = c01(0.18 + 0.62 * d.s + (d.accent ? 0.12 : 0));
-          const n: NoteEvent = {
+          const n: NoteEvent & { opens?: boolean } = {
             id: id(), start: d.start, dur: Math.max(1 / 64, len * gate), midi, vel, origin: i.origin, pitchY: py,
-            timbre: thick, src: [d.x, d.ys[0] ?? d.y], cid: c.id,
+            timbre: thick, src: [d.x, d.ys[0] ?? d.y], cid: c.id, opens: d.opens,
           };
           // bends are stored relative to the note's own pitch
           if (d.bend) n.bend = d.bend.map(([bt, bp]) => [bt, Math.round((bp - midi) * 1000) / 1000]);
@@ -305,6 +305,11 @@ function segmentNotes(S: Sample[], Y: number[], sp: PitchSpace, o: { W: number; 
   let phraseStart = S[0].t;
   let lastDir = 0;
   const quant = (y: number) => o.midiOf(o.qY(o.yv(y)));
+  // musical reduction: above 50 % a new note needs the line to move two scale steps (a ramp reads
+  // as a line of thirds, small wobbles are absorbed); literal reading re-articulates every step
+  const rows = Math.max(1, sp.pitches.length - 1);
+  const rowOf = (y: number) => Math.round(o.qY(o.yv(y)) * rows);
+  const hysteresis = o.W >= 0.5 ? 2 : 1;
   const close = (t: number, breathe = false) => {
     if (!cur) return;
     cur.end = Math.max(cur.start + 1 / 64, t - (breathe ? rest : 0));
@@ -319,18 +324,21 @@ function segmentNotes(S: Sample[], Y: number[], sp: PitchSpace, o: { W: number; 
     const turning = o.W > 0.4 && dir && lastDir && dir !== lastDir; // melodic turning point
     if (dir) lastDir = dir;
     const sharp = q.k > kSharp;
-    const long = q.t - phraseStart > phraseMax;
     if (cur) {
       const c: Draft = cur;
       const dur = q.t - c.start;
-      const pitchMoved = !o.glide && m !== quant(c.y);
-      if ((long || (turning && dur > 1 && o.W > 0.4)) && dur >= o.minDur) { close(q.t, true); phraseStart = q.t; }
+      const pitchMoved = !o.glide && m !== quant(c.y) && Math.abs(rowOf(y) - rowOf(c.y)) >= hysteresis;
+      // a gliding note re-articulates after a long phrase; a musical line breathes where it turns
+      const long = o.glide && q.t - phraseStart > phraseMax;
+      const breathe = pitchMoved && turning && o.W > 0.4 && q.t - phraseStart > 1;
+      if ((long || breathe) && dur >= o.minDur) { close(q.t, true); phraseStart = q.t; }
       else if (sharp && dur >= o.minDur) { close(q.t); cur = { start: q.t, end: q.t, y, ys: [q.y], s: q.s, k: q.k, x: q.x, accent: true, cid: o.cid, bend: o.glide ? [] : undefined }; continue; }
       else if (pitchMoved && dur >= o.minDur) close(q.t);
     }
     if (!cur) {
-      cur = { start: q.t, end: q.t, y, ys: [q.y], s: q.s, k: q.k, x: q.x, cid: o.cid, bend: o.glide ? [] : undefined };
-      if (out.length && q.t - out[out.length - 1].end > 0.5) phraseStart = q.t;
+      const gap = out.length ? q.t - out[out.length - 1].end : Infinity;
+      cur = { start: q.t, end: q.t, y, ys: [q.y], s: q.s, k: q.k, x: q.x, cid: o.cid, bend: o.glide ? [] : undefined, opens: gap > 0.05 };
+      if (gap > 0.5) phraseStart = q.t;
     } else {
       const c: Draft = cur;
       c.s = Math.max(c.s * 0.97, q.s);
@@ -399,15 +407,15 @@ function shapeVoice(notes: NoteEvent[], i: VoiceInput, sp: PitchSpace, o: { W: n
       }
     }
   }
-  // harmonisation (musical interpretation): a diatonic third below long phrase notes
+  // harmonisation (musical interpretation): a diatonic third below the long note that opens a phrase
   const h = o.W * (1 - 0.85 * o.F);
   const extra: NoteEvent[] = [];
-  if (h > 0.05) {
-    for (const n of notes) {
-      if (n.dur < 1 || n.pitchY === undefined || !i.rng.chance(Math.min(0.9, h * 1.4))) continue;
-      const off = (n.stepOffset ?? 0) - 2;
-      extra.push({ ...n, id: `${n.id}h`, midi: mapY(n.pitchY, sp.pitches, off), stepOffset: off, vel: n.vel * 0.6, bend: undefined });
-    }
+  for (const n of notes as (NoteEvent & { opens?: boolean })[]) {
+    const opens = n.opens;
+    delete n.opens;
+    if (h <= 0.05 || !opens || n.dur < 1 || n.pitchY === undefined || !i.rng.chance(Math.min(0.9, h * 1.4))) continue;
+    const off = (n.stepOffset ?? 0) - 2;
+    extra.push({ ...n, id: `${n.id}h`, midi: mapY(n.pitchY, sp.pitches, off), stepOffset: off, vel: n.vel * 0.6, bend: undefined });
   }
   return [...notes, ...extra].sort((a, b) => a.start - b.start || a.midi - b.midi);
 }
@@ -475,7 +483,16 @@ export function visualEvents(grid: FeatureGrid, set: ContourSet, density: number
       const v = Math.abs((grid.lum[b] / Math.max(1, grid.count[b])) - (grid.lum[a] / Math.max(1, grid.count[a])));
       if (v > bv) { bv = v; br = r; }
     }
-    ev.push({ x: c / C, y: 1 - (br + 0.5) / R, strength: Math.min(1, nov[c] * 2.5), kind: 'boundary' });
+    // refine x to the strongest pixel column of the edge profile near the grid boundary
+    const W = grid.colEdge.length;
+    let bx = c / C;
+    if (W) {
+      const lo = Math.max(0, Math.floor(((c - kw - 1) / C) * W)), hi = Math.min(W - 1, Math.ceil(((c + kw + 1) / C) * W));
+      let bi = -1, be = 0;
+      for (let x = lo; x <= hi; x++) if (grid.colEdge[x] > be) { be = grid.colEdge[x]; bi = x; }
+      if (bi >= 0) bx = (bi + 0.5) / W;
+    }
+    ev.push({ x: bx, y: 1 - (br + 0.5) / R, strength: Math.min(1, nov[c] * 2.5), kind: 'boundary' });
   }
   return thinEvents(ev, lerp(0.55, 0.12, c01(density)), lerp(0.05, 0.006, c01(density)));
 }
@@ -484,7 +501,9 @@ export function visualEvents(grid: FeatureGrid, set: ContourSet, density: number
 function thinEvents(ev: VisualEvent[], floor: number, gap: number): VisualEvent[] {
   const sorted = ev.filter((e) => e.strength >= floor).sort((a, b) => b.strength - a.strength);
   const kept: VisualEvent[] = [];
-  for (const e of sorted) if (kept.every((k) => Math.abs(k.x - e.x) >= gap || Math.abs(k.y - e.y) > 0.25)) kept.push(e);
+  // contour events at clearly different heights may coincide (a chord of starts); a boundary is a
+  // whole-column event and absorbs anything else at that moment
+  for (const e of sorted) if (kept.every((k) => Math.abs(k.x - e.x) >= gap || (Math.abs(k.y - e.y) > 0.25 && k.kind !== 'boundary' && e.kind !== 'boundary'))) kept.push(e);
   return kept.sort((a, b) => a.x - b.x);
 }
 

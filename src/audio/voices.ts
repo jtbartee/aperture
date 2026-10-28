@@ -332,9 +332,16 @@ function periodicWave(ctx: BaseAudioContext, amps: number[]): PeriodicWave {
   const key = amps.join(',');
   let w = m.get(key);
   if (!w) {
+    // Schroeder phases: same magnitude spectrum, but the partials no longer line up into a
+    // sawtooth-like vertical edge every cycle (lower crest factor, no per-period spike)
     const real = new Float32Array(amps.length + 1);
     const imag = new Float32Array(amps.length + 1);
-    amps.forEach((a, k) => { imag[k + 1] = a; });
+    const N = amps.length;
+    amps.forEach((a, k) => {
+      const ph = (Math.PI * k * (k + 1)) / Math.max(1, N);
+      real[k + 1] = a * Math.sin(ph);
+      imag[k + 1] = a * Math.cos(ph);
+    });
     w = ctx.createPeriodicWave(real, imag);
     m.set(key, w);
   }
@@ -351,8 +358,10 @@ function buildImage(ctx: BaseAudioContext, p: SynthPatch, midi: number, vel: num
   const sources: AudioScheduledSourceNode[] = [];
   const bus = (n: BusName) => o.bus?.(n) ?? null;
   const scaled = (src: AudioNode, k: number, dest: AudioParam) => { const g = ctx.createGain(); g.gain.value = k; src.connect(g).connect(dest); };
-  // keep partials below Nyquist: drop the upper harmonics for high notes
-  const maxH = Math.max(1, Math.floor(nyq / f));
+  // keep every partial AND its FM sidebands below Nyquist (≈ (index + 1) · ratio · f either side
+  // of each harmonic, at the bus's maximum index of 3) — aliased FM grit sounds like clicks
+  const ratio = o.fmRatio ?? ip.fmRatio;
+  const maxH = Math.max(1, Math.floor(nyq / f - 4 * ratio));
   const tableA = periodicWave(ctx, ip.wavesA.slice(0, maxH));
   const tableB = periodicWave(ctx, ip.wavesB.slice(0, maxH));
   const oscA = ctx.createOscillator();
@@ -383,7 +392,6 @@ function buildImage(ctx: BaseAudioContext, p: SynthPatch, midi: number, vel: num
   oscA.connect(gA).connect(mix);
   oscB.connect(gB).connect(mix);
   // FM: one sine modulator on both tables
-  const ratio = o.fmRatio ?? ip.fmRatio;
   const mod = ctx.createOscillator();
   mod.frequency.value = f * ratio;
   const modGain = ctx.createGain();

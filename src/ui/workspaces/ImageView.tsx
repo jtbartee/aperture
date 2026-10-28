@@ -48,12 +48,16 @@ export function ImageView() {
     const pos = engine.position();
     // the contours whose notes are sounding at the playhead (traceable sight ↔ sound)
     const active = new Set<string>();
+    const voiced = new Set<string>();
     const sounding: [number, number, string][] = [];
     for (const t of p.tracks) {
       if (!t.generator?.startsWith('image:') || t.mix.mute) continue;
-      for (const n of t.notes) if (n.start <= pos && n.start + n.dur > pos) { if (n.cid) active.add(n.cid); if (n.src) sounding.push([n.src[0], n.src[1], t.color]); }
+      for (const n of t.notes) {
+        if (n.cid) voiced.add(n.cid);
+        if (n.start <= pos && n.start + n.dur > pos) { if (n.cid) active.add(n.cid); if (n.src) sounding.push([n.src[0], n.src[1], t.color]); }
+      }
     }
-    if (a && view !== 'photo') drawContours(ctx, a.contours, { X: (x) => x0 + x * dw, Y: (y) => y0 + (1 - y) * dh, sx: dw, sy: dh, active, junctions: layers.junctions, width: view === 'contours' ? 2 : 1.8 });
+    if (a && view !== 'photo') drawContours(ctx, a.contours, { X: (x) => x0 + x * dw, Y: (y) => y0 + (1 - y) * dh, sx: dw, sy: dh, active, voiced: voiced.size ? voiced : undefined, junctions: layers.junctions, width: view === 'contours' ? 2 : 1.8 });
     if (layers.notes && view !== 'contours') {
       for (const t of p.tracks) {
         if (!t.generator?.startsWith('image:') && !t.notes.some((n) => n.origin === 'image')) continue;

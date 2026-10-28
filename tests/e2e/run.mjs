@@ -213,7 +213,7 @@ try {
     await page.waitForFunction(() => { const p = window.__aperture.store.getState().project; return p.panorama && p.tracks.some((t) => t.generator?.startsWith('pano:')); }, null, { timeout: 60000 });
     await sleep(800);
     const info = await S(() => { const p = window.__aperture.store.getState().project; return { w: p.panorama.asset.width, layers: p.tracks.map((t) => `${t.name}:${t.notes.length}`), bars: p.settings.lengthBars, bpm: p.settings.bpm }; });
-    check('Panoramic Journey loads a 4800-px generated panorama with region layers', info.w === 4800 && info.layers.length >= 4, `${info.layers.join(' · ')} · ${info.bars} bars`);
+    check('Panoramic Journey loads a 4800-px generated panorama with contour voices and an atmosphere (no drum kit)', info.w === 4800 && info.layers.length >= 3 && info.layers.some((l) => /Atmosphere/.test(l)) && info.layers.some((l) => /ridge/.test(l)) && !info.layers.some((l) => /drum/i.test(l)), `${info.layers.join(' · ')} · ${info.bars} bars`);
     const shot = async (name) => { await page.screenshot({ path: `${OUT}${name}.png` }); return page.locator('.stage canvas').screenshot(); };
     await S(() => window.__aperture.engine.play(0));
     await sleep(600);
@@ -500,6 +500,210 @@ try {
       check(`audio audit “${id}”: no clipping, limiter rarely engaged, no DC`, a.peak < 0.99 && a.overPct < 0.5 && Math.abs(a.dc) < 0.01, `peak ${(20 * Math.log10(a.peak)).toFixed(1)} dBFS, ${a.overPct.toFixed(3)}% near ceiling, DC ${a.dc.toExponential(1)}`);
       check(`audio audit “${id}”: no clicks on tonal layers`, a.clicks === 0, `${a.clicks} isolated spikes (worst ${a.worst.toFixed(1)}× local level)${a.at.length ? ' at ' + a.at.map((x) => x.toFixed(3)).join(', ') + ' s' : ''}`);
     }
+  }
+
+  // ------------------------------------------------------------------ sonification: measured results
+  if (want('sonify')) {
+    const LDIR = `${OUT}listening/`;
+    mkdirSync(LDIR, { recursive: true });
+    // page-side audio analysis: STFT features, spectral-flux onsets, click audit, spectrogram
+    await S(() => {
+      const fft = (re, im) => {
+        const n = re.length;
+        for (let i = 1, j = 0; i < n; i++) { let bit = n >> 1; for (; j & bit; bit >>= 1) j ^= bit; j ^= bit; if (i < j) { [re[i], re[j]] = [re[j], re[i]]; [im[i], im[j]] = [im[j], im[i]]; } }
+        for (let len = 2; len <= n; len <<= 1) {
+          const ang = (-2 * Math.PI) / len, wr = Math.cos(ang), wi = Math.sin(ang);
+          for (let i = 0; i < n; i += len) { let cr = 1, ci = 0; for (let k = 0; k < len / 2; k++) { const ar = re[i + k], ai = im[i + k], br = re[i + k + len / 2] * cr - im[i + k + len / 2] * ci, bi = re[i + k + len / 2] * ci + im[i + k + len / 2] * cr; re[i + k] = ar + br; im[i + k] = ai + bi; re[i + k + len / 2] = ar - br; im[i + k + len / 2] = ai - bi; const t = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = t; } }
+        }
+      };
+      const mono = (b) => { const a = b.getChannelData(0), c = b.numberOfChannels > 1 ? b.getChannelData(1) : a; const m = new Float32Array(a.length); for (let i = 0; i < a.length; i++) m[i] = (a[i] + c[i]) / 2; return m; };
+      const stft = (b, N = 2048, H = 1024) => {
+        const x = mono(b), win = new Float32Array(N).map((_, i) => 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / N));
+        const frames = [];
+        for (let s0 = 0; s0 + N <= x.length; s0 += H) {
+          const re = new Float32Array(N), im = new Float32Array(N);
+          let e = 0;
+          for (let i = 0; i < N; i++) { re[i] = x[s0 + i] * win[i]; e += x[s0 + i] ** 2; }
+          fft(re, im);
+          const mag = new Float32Array(N / 2);
+          for (let k = 0; k < N / 2; k++) mag[k] = Math.hypot(re[k], im[k]);
+          frames.push({ t: (s0 + N / 2) / b.sampleRate, rms: Math.sqrt(e / N), mag });
+        }
+        return frames;
+      };
+      window.__audio = {
+        features(b) {
+          const fr = stft(b);
+          const sr = b.sampleRate, N = 2048;
+          let peak = 0, over = 0, n = 0, sq = 0;
+          for (let c = 0; c < b.numberOfChannels; c++) { const d = b.getChannelData(c); for (let i = 0; i < d.length; i++) { const v = Math.abs(d[i]); peak = Math.max(peak, v); if (v > 0.83) over++; sq += v * v; n++; } }
+          const cents = [], flux = [];
+          let prev = null;
+          for (const f of fr) {
+            let num = 0, den = 0;
+            for (let k = 1; k < f.mag.length; k++) { num += f.mag[k] * (k * sr) / N; den += f.mag[k]; }
+            f.centroid = den > 0 ? num / den : 0;
+            if (f.rms > 0.003) cents.push(f.centroid);
+            let fl = 0;
+            if (prev) for (let k = 1; k < f.mag.length; k++) fl += Math.max(0, Math.log1p(f.mag[k] * 10) - Math.log1p(prev.mag[k] * 10));
+            flux.push(fl);
+            prev = f;
+          }
+          // onsets: spectral-flux peaks above an adaptive threshold
+          const onsets = [];
+          for (let i = 1; i < flux.length - 1; i++) {
+            const lo = Math.max(0, i - 8), hi = Math.min(flux.length, i + 9);
+            const loc = flux.slice(lo, hi).sort((a, z) => a - z);
+            const med = loc[loc.length >> 1];
+            if (flux[i] > flux[i - 1] && flux[i] >= flux[i + 1] && flux[i] > med * 1.6 + 2 && (!onsets.length || fr[i].t - onsets[onsets.length - 1] > 0.06)) onsets.push(fr[i].t);
+          }
+          const mean = (a) => a.reduce((x, y) => x + y, 0) / Math.max(1, a.length);
+          const cm = mean(cents);
+          return { seconds: b.duration, peak, overPct: (over / n) * 100, rms: Math.sqrt(sq / n), centroid: cm, centroidStd: Math.sqrt(mean(cents.map((c) => (c - cm) ** 2))), onsets, silentFrac: fr.filter((f) => f.rms < 0.0015).length / Math.max(1, fr.length), frames: fr.map((f) => [f.t, f.rms, f.centroid]) };
+        },
+        clicks(b) {
+          let clicks = 0, worst = 0;
+          const W = 256;
+          for (let c = 0; c < b.numberOfChannels; c++) {
+            const d = b.getChannelData(c);
+            const dd = new Float32Array(d.length);
+            for (let i = 2; i < d.length; i++) dd[i] = Math.abs(d[i] - 2 * d[i - 1] + d[i - 2]);
+            let acc = 0;
+            for (let i = 0; i < Math.min(W, dd.length); i++) acc += dd[i];
+            for (let i = W; i < dd.length - W; i++) { acc += dd[i + W] - dd[i - W]; const local = acc / (2 * W); worst = Math.max(worst, dd[i] / Math.max(1e-4, local)); if (dd[i] > 0.02 && dd[i] > local * 12) clicks++; }
+          }
+          return { clicks, worst };
+        },
+        spectrogram(b, W = 1200, H = 360) {
+          const fr = stft(b, 2048, Math.max(256, Math.floor((b.length - 2048) / W)));
+          const c = document.createElement('canvas'); c.width = W; c.height = H;
+          const g = c.getContext('2d'); const img = g.createImageData(W, H);
+          const sr = b.sampleRate;
+          for (let x = 0; x < W; x++) {
+            const f = fr[Math.min(fr.length - 1, Math.floor((x / W) * fr.length))];
+            for (let y = 0; y < H; y++) {
+              const hz = 40 * Math.pow(16000 / 40, 1 - y / (H - 1));
+              const k = Math.min(f.mag.length - 1, Math.round((hz * 2048) / sr));
+              const db = 20 * Math.log10(f.mag[k] + 1e-9);
+              const v = Math.max(0, Math.min(1, (db + 40) / 70));
+              const j = (y * W + x) * 4;
+              img.data[j] = 255 * Math.min(1, v * 1.6); img.data[j + 1] = 255 * Math.max(0, v * 1.5 - 0.4); img.data[j + 2] = 255 * Math.max(0, 0.5 - Math.abs(v - 0.4)) * 1.4; img.data[j + 3] = 255;
+            }
+          }
+          g.putImageData(img, 0, 0);
+          return c.toDataURL('image/png');
+        },
+      };
+    });
+    const loadSource = (o) => S(async (o) => {
+      const { api, store } = window.__aperture;
+      const s = store.getState();
+      s.newProject();
+      if (o.ps) s.setSettings(o.ps);
+      const r = api[o.fn](...o.args);
+      const blob = await api.rgbaToPng(r.img ?? r);
+      await store.getState().importImage(blob, `${o.fn}.png`, o.kind, o.settings);
+      const p = store.getState().project;
+      return p.tracks.filter((t) => t.generator?.startsWith(o.kind === 'image' ? 'image:' : 'pano:')).map((t) => ({ id: t.id, key: t.generator, name: t.name, notes: t.notes.length, engine: t.patch.engine }));
+    }, o);
+    const render = (o) => S(async (o) => {
+      const { api, store } = window.__aperture;
+      let p = store.getState().project;
+      // dry: no inserts, sends or echo lanes — for measuring where notes start, not their tails
+      if (o.dry) p = { ...p, tracks: p.tracks.map((t) => ({ ...t, fx: [], mix: { ...t.mix, reverb: 0, delay: 0 }, automation: t.automation.filter((a) => !['reverbSend', 'delaySend', 'delayFeedback'].includes(a.target)) })) };
+      const only = o.only ? p.tracks.filter((t) => o.only.some((k) => t.generator === k || t.generator?.startsWith(k))).map((t) => t.id) : undefined;
+      const to = o.to ?? p.settings.lengthBars * 4;
+      const b = await api.renderOffline(p, { from: 0, to, tail: o.tail ?? 3, sampleRate: 44100, only });
+      const f = window.__audio.features(b);
+      let tonal = null;
+      if (o.audit) {
+        const ids = p.tracks.filter((t) => (!only || only.includes(t.id)) && t.notes.length && !['drums', 'glitch', 'noise'].includes(t.patch.engine)).map((t) => t.id);
+        if (ids.length) tonal = window.__audio.clicks(await api.renderOffline(p, { from: 0, to, tail: 1, sampleRate: 44100, only: ids }));
+      }
+      let wav = null, png = null;
+      if (o.save) {
+        const bytes = new Uint8Array(api.encodeWav([b.getChannelData(0), b.getChannelData(1)], b.sampleRate, 16));
+        let str = ''; const CH = 0x8000;
+        for (let i = 0; i < bytes.length; i += CH) str += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+        wav = btoa(str);
+        png = window.__audio.spectrogram(b);
+      }
+      return { f, tonal, wav, png, bpm: p.settings.bpm };
+    }, o);
+    const dB = (x) => (20 * Math.log10(Math.max(1e-9, x))).toFixed(1);
+    const fs = await import('node:fs');
+    const saveDemo = (name, r) => {
+      fs.writeFileSync(`${LDIR}${name}.wav`, Buffer.from(r.wav, 'base64'));
+      fs.writeFileSync(`${LDIR}${name}-spectrogram.png`, Buffer.from(r.png.split(',')[1], 'base64'));
+    };
+    const report = [];
+
+    // 1. empty image: literal contour mode must render silence
+    await loadSource({ fn: 'uniformImage', args: [480, 320], kind: 'image', settings: { mode: 'contour', bars: 8, interpretation: 0 } });
+    const empty = await render({ to: 32, tail: 1 });
+    check('empty image: literal contour mode renders silence (no invented notes)', empty.f.peak < 1e-4, `peak ${dB(empty.f.peak)} dBFS over ${empty.f.seconds.toFixed(1)} s`);
+
+    // 2. free time: rendered onsets of irregularly spaced bars follow the bars, not a grid
+    const xs = [0.06, 0.1, 0.27, 0.31, 0.44, 0.71, 0.74, 0.93];
+    await loadSource({ fn: 'irregularBars', args: [480, 240, xs, 5], kind: 'image', settings: { mode: 'contour', bars: 16, rhythm: 'free', density: 0.6 }, ps: { bpm: 90 } });
+    const ft = await render({ only: ['image:rhythm'], to: 64, tail: 1, dry: true });
+    const spb = 60 / 90;
+    const expected = xs.map((x) => ((x * 480 - 2.5) / 480) * 64 * spb);
+    // one image pixel is 64 / 480 beats ≈ 89 ms here and the analysis hop is 23 ms: allow ~2 px
+    const hit = expected.filter((t) => ft.f.onsets.some((o) => Math.abs(o - t) < 0.2)).length;
+    const extra = ft.f.onsets.filter((o) => !expected.some((t) => Math.abs(o - t) < 0.2)).length;
+    check('free time (rendered audio): onsets sit on the irregular bars and nowhere else', hit === xs.length && extra === 0, `${hit}/${xs.length} bars heard, ${extra} extra onsets; onsets ${ft.f.onsets.map((t) => t.toFixed(2)).join(' ')} s`);
+
+    // 3. contrast: two photographs, identical settings and seed → different rendered sound
+    const contrastSettings = { mode: 'hybrid', bars: 8, seed: 1, density: 0.5 };
+    await loadSource({ fn: 'hazeImage', args: [480, 320, 9], kind: 'image', settings: contrastSettings });
+    const hz = await render({ to: 32, tail: 2 });
+    await loadSource({ fn: 'colorfulTexture', args: [480, 320], kind: 'image', settings: contrastSettings });
+    const tx = await render({ to: 32, tail: 2 });
+    report.push(`contrast: haze centroid ${hz.f.centroid.toFixed(0)} Hz, ${hz.f.onsets.length} onsets, ${(hz.f.silentFrac * 100).toFixed(0)}% silent · texture centroid ${tx.f.centroid.toFixed(0)} Hz, ${tx.f.onsets.length} onsets, ${(tx.f.silentFrac * 100).toFixed(0)}% silent`);
+    check('contrast (rendered audio): the textured photo is brighter and far more eventful than the haze', tx.f.centroid > hz.f.centroid * 1.25 && tx.f.onsets.length > hz.f.onsets.length * 2, report[report.length - 1]);
+
+    // 4. panorama: the rendered sound changes as the scan crosses the landscape zones
+    await loadSource({ fn: 'panoramaLandscape', args: [4800, 900, 7], kind: 'panorama', settings: { timing: 'free', seconds: 90, evolution: 0.9, density: 0.4 }, ps: { bpm: 80, key: 2, scale: 'minor' } });
+    const pano = await render({ tail: 3, audit: true, save: true });
+    saveDemo('4-panorama-evolving-journey', pano);
+    const zones = [[0, 0.18], [0.18, 0.36], [0.36, 0.52], [0.52, 0.68], [0.68, 0.84], [0.84, 1]].map(([a, b]) => {
+      const fr = pano.f.frames.filter(([t]) => t >= a * 90 && t < b * 90);
+      const loud = fr.filter((x) => x[1] > 0.003);
+      return { rms: Math.sqrt(fr.reduce((s, x) => s + x[1] ** 2, 0) / Math.max(1, fr.length)), centroid: loud.reduce((s, x) => s + x[2], 0) / Math.max(1, loud.length), onsets: pano.f.onsets.filter((t) => t >= a * 90 && t < b * 90).length / ((b - a) * 90) };
+    });
+    const cz = zones.map((z) => z.centroid);
+    report.push(`panorama zones: centroid ${cz.map((c) => c.toFixed(0)).join(' / ')} Hz · onsets/s ${zones.map((z) => z.onsets.toFixed(2)).join(' / ')} · rms ${zones.map((z) => dB(z.rms)).join(' / ')} dB`);
+    check('panorama (rendered audio): timbre and activity change from zone to zone', Math.max(...cz) / Math.min(...cz) > 1.25 && Math.max(...zones.map((z) => z.onsets)) > 2 * Math.min(...zones.map((z) => z.onsets)) + 0.05, report[report.length - 1]);
+    check('panorama render: no clipping, no clicks on Image Synth layers', pano.f.peak < 0.99 && pano.f.overPct < 0.5 && (!pano.tonal || pano.tonal.clicks === 0), `peak ${dB(pano.f.peak)} dBFS, ${pano.f.overPct.toFixed(3)}% near ceiling, ${pano.tonal?.clicks ?? 0} clicks (worst ${pano.tonal?.worst.toFixed(1)}×)`);
+
+    // 5. listening set (WAV + spectrogram in tests/e2e/out/listening/)
+    const demos = [
+      { name: '1-contour-only-melody', src: { fn: 'ridgesImage', args: [560, 320], kind: 'image', settings: { mode: 'contour', bars: 16, interpretation: 0.3, fidelity: 0.8, density: 0.6, hybrid: { contour: true, atmosphere: false, bass: false, pads: false, percussion: false, filter: true } }, ps: { bpm: 84, key: 9, scale: 'minor' } }, only: ['image:contour'] },
+      { name: '2-image-texture-rhythm', src: { fn: 'colorfulTexture', args: [480, 320], kind: 'image', settings: { mode: 'contour', bars: 16, rhythm: 'texture', density: 0.6 }, ps: { bpm: 100 } }, only: ['image:rhythm'] },
+      { name: '3-atmospheric-image-synthesis', src: { fn: 'hazeImage', args: [640, 400, 5], kind: 'image', settings: { mode: 'hybrid', bars: 16, evolution: 0.95, structure: 0.4 }, ps: { bpm: 70, key: 4, scale: 'lydian' } } },
+      { name: '5-multi-contour-glides', src: { fn: 'contourFixture', args: [], kind: 'image', settings: { mode: 'contour', bars: 16, contour: { preset: 'lineart', sensitivity: 0.7, minStrength: 0.15, minLength: 12, detail: 0.8, smoothing: 0.2, curvature: 0.8, separation: 0.2, branches: 0.8, maxContours: 40, multiScale: 0.1 }, density: 1, glide: true, structure: 0.1, interpretation: 0.2, fidelity: 1 }, ps: { bpm: 72 } } },
+    ];
+    for (const d of demos) {
+      const layers = await loadSource(d.src);
+      const r = await render({ only: d.only, tail: 4, audit: true, save: true });
+      saveDemo(d.name, r);
+      report.push(`${d.name}: ${layers.map((l) => `${l.name} (${l.engine}, ${l.notes})`).join(', ')} · ${r.f.seconds.toFixed(0)} s, peak ${dB(r.f.peak)} dBFS, RMS ${dB(r.f.rms)} dB, centroid ${r.f.centroid.toFixed(0)}±${r.f.centroidStd.toFixed(0)} Hz, ${r.f.onsets.length} onsets, ${(r.f.silentFrac * 100).toFixed(0)}% silent, clicks ${r.tonal?.clicks ?? '–'}`);
+      check(`listening demo “${d.name}”: audible, unclipped, click-free`, r.f.rms > 0.003 && r.f.peak < 0.99 && r.f.overPct < 0.5 && (!r.tonal || r.tonal.clicks === 0), report[report.length - 1]);
+    }
+    fs.writeFileSync(`${LDIR}report.txt`, report.join('\n') + '\n');
+
+    // 6. the three image views and the panorama overlay (screenshots)
+    await loadSource({ fn: 'contourFixture', args: [], kind: 'image', settings: { mode: 'contour', bars: 16, contour: { preset: 'lineart', sensitivity: 0.7, minStrength: 0.15, minLength: 12, detail: 0.8, smoothing: 0.2, curvature: 0.8, separation: 0.2, branches: 0.8, maxContours: 40, multiScale: 0.1 } } });
+    await S(() => window.__aperture.store.getState().setWorkspace('image'));
+    await sleep(400);
+    for (const v of ['photo', 'contours', 'overlay']) {
+      await page.click(`button[data-view="${v}"]`);
+      await sleep(250);
+      await page.screenshot({ path: `${OUT}view-${v}.png` });
+    }
+    const pressed = await page.getAttribute('button[data-view="overlay"]', 'aria-pressed');
+    check('image views: photograph / extracted contours / overlay are selectable', pressed === 'true');
   }
 
   check('no uncaught errors in the console', errors.length === 0, errors.slice(0, 3).join(' | '));

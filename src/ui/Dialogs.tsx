@@ -133,8 +133,10 @@ function ExportDialog({ onClose }: { onClose: () => void }) {
 const STATUS: [string, 'ok' | 'part', string][] = [
   ['Drawing instrument (6 tools + shapes, 6 brushes, select/move/resize/duplicate, eraser, zoom/pan, stylus pressure)', 'ok', 'Automated + browser tested'],
   ['Key/scale remapping without touching sources (17 scales + custom)', 'ok', 'Automated tests'],
-  ['Image sonification: contour, colour & texture, atmospheric, hybrid', 'ok', 'Automated + browser tested'],
-  ['Panorama sequencer: tiled analysis, scrolling playhead, free/beat timing, 5 scan directions, regions/masks/lasso/path', 'ok', 'Automated + browser tested'],
+  ['Image sonification: traced contours as voices, colour & texture, atmospheric, hybrid; photo / contour / overlay views', 'ok', 'Automated + browser tested (contour fidelity measured)'],
+  ['Free-time, image-texture and metric rhythm; no default drum kit', 'ok', 'Automated + rendered-audio tests'],
+  ['Image Synth: image wavetables, FM, noise, LFO, reassignable feature → parameter mapping, evolving lanes', 'ok', 'Rendered-audio tests; not yet reviewed by ear'],
+  ['Panorama sequencer: contour voices, evolving atmosphere, tiled analysis, free/beat timing, 5 scan directions, regions/masks/lasso/path', 'ok', 'Automated + browser tested'],
   ['Generative composer: 8 styles, 5 structures, locks, seeds, mutation/evolution', 'ok', 'Automated tests'],
   ['12 instruments + drum kit, 26 factory presets, sound editor, user presets', 'ok', 'Browser tested (rendered audio)'],
   ['Effects: 14 insert types incl. Atmospheric Sweep; reverb/delay sends; modulation matrix', 'ok', 'Browser tested'],
@@ -156,8 +158,8 @@ function HelpDialog({ onClose }: { onClose: () => void }) {
           <p><b>The image is the score.</b> Everything you draw, import or generate becomes ordinary note events on layers — the same events play live, render to WAV and export to MIDI.</p>
           <ul>
             <li><b>Draw</b>: pick a layer and a brush, draw left→right. Vertical position is pitch in the layer's range and the project key/scale.</li>
-            <li><b>Image</b>: import a photo. Choose Contour, Colour, Atmospheric or Hybrid in the inspector. Every derived layer is editable in the piano roll.</li>
-            <li><b>Panorama</b>: import a very wide image; it scrolls under a fixed playhead. Assign roles to image bands or painted regions.</li>
+            <li><b>Image</b>: import a photo. Its contours are traced and each plays as a voice — left to right is time, height is pitch, gaps are silence. Switch between Photo, Contours and Overlay to see exactly what is heard. Shape the reading with Visual fidelity, Musical structure, Evolution and Event density; choose Free time, Image texture or Metric beat. Every derived layer is editable in the piano roll.</li>
+            <li><b>Panorama</b>: import a very wide image; it scrolls under a fixed playhead. Ridgelines become voices over an evolving atmosphere whose timbre follows the scan; classic band and painted-region roles are still available.</li>
             <li><b>Generative</b>: choose a style and press Generate; guide it with your drawing or image; lock what you like and regenerate the rest.</li>
             <li>Change sounds in <b>Sound</b>/<b>FX</b>; that never re-analyses the image. Changing the scale re-pitches notes without touching drawings.</li>
           </ul>

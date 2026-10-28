@@ -21,7 +21,9 @@ import { projectToMidi } from '../export/midi';
 import { INSTRUMENTS, instrument } from '../audio/patches';
 import { getAnalysis, getLevels } from '../analysis/client';
 import { scanPoint, displayBeats } from '../interpret/panorama';
-import { colorfulTexture, darkUniform } from '../analysis/procedural';
+import { colorfulTexture, contourFixture, darkUniform, hazeImage, irregularBars, panoramaLandscape, ridgesImage, uniformImage } from '../analysis/procedural';
+import { contourPreset } from '../analysis/contours';
+import { encodeWav } from '../audio/wav';
 import { rgbaToPng } from '../analysis/client';
 
 const WORKSPACES: { id: Workspace; label: string; hint: string }[] = [
@@ -54,7 +56,10 @@ export function App() {
     // debug / test surface: lets the end-to-end suite measure real audio and analysis state
     (window as any).__aperture = {
       store: useStore, engine, Tone, loadFactory,
-      api: { renderOffline, peakAndRms, projectToMidi, INSTRUMENTS, instrument, getAnalysis, getLevels, scanPoint, displayBeats, darkUniform, colorfulTexture, rgbaToPng },
+      api: {
+        renderOffline, peakAndRms, projectToMidi, INSTRUMENTS, instrument, getAnalysis, getLevels, scanPoint, displayBeats, darkUniform, colorfulTexture, rgbaToPng,
+        hazeImage, ridgesImage, irregularBars, uniformImage, contourFixture, panoramaLandscape, contourPreset, encodeWav,
+      },
       liveRms: () => {
         const a = engine.graph?.analyser;
         if (!a) return 0;

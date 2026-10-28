@@ -162,19 +162,24 @@ function computePeriodicity(grid: FeatureGrid) {
     mean /= W;
     let v0 = 0;
     for (let x = a; x < a + W; x++) v0 += (sig[x] - mean) ** 2;
-    if (v0 < 1e-6 || mean < 0.01) { grid.period[c] = 0; continue; }
-    let best = 0;
-    let prev = 1, prev2 = 1;
-    for (let L = 2; L <= Math.floor(W / 3); L++) {
+    if (v0 < 1e-6 || mean < 0.012) { grid.period[c] = 0; continue; }
+    const ac = new Float32Array(Math.floor(W / 2) + 1);
+    for (let L = 1; L < ac.length; L++) {
       let r = 0;
       for (let x = a; x < a + W - L; x++) r += (sig[x] - mean) * (sig[x + L] - mean);
-      r /= v0 * ((W - L) / W);
-      // a genuine period is a local maximum after the zero-lag lobe has fallen away
-      if (L >= 4 && prev > prev2 && prev >= r && prev > best && prev2 < 0.9) best = prev;
-      prev2 = prev;
-      prev = r;
+      ac[L] = r / (v0 * ((W - L) / W));
     }
-    grid.period[c] = Math.max(0, Math.min(1, (best - 0.15) / 0.6));
+    // a genuine period repeats: a local maximum at lag L (after the zero-lag lobe has fallen
+    // away) confirmed at 2L — two isolated features are not a repetition
+    let best = 0;
+    for (let L = 4; 2 * L + 1 < ac.length; L++) {
+      if (!(ac[L] > ac[L - 1] && ac[L] >= ac[L + 1]) || ac[L - 2] > 0.9) continue;
+      const twice = Math.max(ac[2 * L - 1], ac[2 * L], ac[2 * L + 1]);
+      best = Math.max(best, Math.min(ac[L], twice));
+    }
+    // weight by evidence: a few faint edges correlate by chance
+    const evidence = Math.min(1, mean / 0.04);
+    grid.period[c] = Math.max(0, Math.min(1, ((best - 0.15) / 0.6) * evidence));
   }
 }
 

@@ -70,6 +70,10 @@ const NEUTRAL: Record<SynthCharacter, Partial<Record<SynthTarget, number>>> = {
 
 const FM_RATIOS = [0.5, 1, 1.5, 2, 3, 4, 5];
 const c01 = (x: number) => (x < 0 ? 0 : x > 1 ? 1 : x);
+// mappings combine in logit space: the image's average and its evolution both move a parameter,
+// but it approaches its limits asymptotically instead of pinning there (a pinned lane cannot move)
+const logit = (v: number) => { const x = Math.min(0.99, Math.max(0.01, v)); return Math.log(x / (1 - x)); };
+const logistic = (x: number) => 1 / (1 + Math.exp(-x));
 
 /** Normalised lane value → physical unit (shared with the channel buses in audio/graph.ts). */
 export const unit = {
@@ -84,7 +88,7 @@ export const unit = {
   release: (v: number) => 0.03 * Math.pow(2, v * 8), // 30 ms … 7.7 s
   lfoRate: (v: number) => 0.03 * Math.pow(2, v * 8), // 0.03 … 7.7 Hz
   lfoDepth: (v: number) => v,
-  tremolo: (v: number) => v,
+  tremolo: (v: number) => v * 0.6, // at most ±30 % amplitude: a shimmer, not a gate
 };
 
 /** Statistics of one image region for patch derivation. */
@@ -116,11 +120,16 @@ export function regionFeatures(grid: FeatureGrid, mask: MaskFn, cv: Curve): Regi
   return { summary: curveSummary(cv), rowLum, rowEdge };
 }
 
+/** Typical ranges differ per feature (edge density rarely passes 0.4, brightness spans 0..1):
+ *  each is scaled so a typical photograph spans roughly 0..1 before it moves a parameter. */
+export const FEATURE_SCALE: Partial<Record<FeatureKey, number>> = { saturation: 1.3, contrast: 1.8, edges: 2.5, texture: 2.2, variation: 3, periodicity: 1.2 };
+const norm = (f: FeatureKey, v: number) => c01(v * (FEATURE_SCALE[f] ?? 1));
+
 const featMean = (s: RegionFeatures['summary'], f: FeatureKey): number => {
   switch (f) {
     case 'none': return 0.5;
     case 'centroid': return 0.5;
-    default: return (s as Record<string, number>)[f] ?? 0.5;
+    default: return norm(f, (s as Record<string, number>)[f] ?? 0.5);
   }
 };
 
@@ -129,7 +138,7 @@ export function staticValue(target: SynthTarget, character: SynthCharacter, map:
   const n = NEUTRAL[character][target] ?? 0.5;
   const m = map.find((x) => x.target === target);
   if (!m || m.source === 'none') return n;
-  return c01(n + m.amount * 0.9 * (featMean(s, m.source) - 0.5));
+  return logistic(logit(n) + m.amount * 3 * (featMean(s, m.source) - 0.5));
 }
 
 function harmonics(profile: Float32Array, floor: number, roll: number, gain: number, N = 24): number[] {
@@ -171,8 +180,9 @@ export function deriveImageSynth(name: string, character: SynthCharacter, f: Reg
     engine: 'image',
     image,
     // the voice filter stays open and key-tracked; the image-driven cutoff lives on the channel
-    filter: { type: 'lowpass', cutoff: character === 'pluck' ? 2600 : 7000, res: 0.7, envAmt: character === 'pluck' ? 2.2 : character === 'texture' ? 1.2 : 0.3, keyTrack: 0.5 },
-    fenv: { a: 0.002, d: character === 'pluck' ? 0.25 : 0.6, s: 0.2, r: 0.4 },
+    // a filter envelope faster than ~10 ms over FM-rich partials bursts like a click: keep it musical
+    filter: { type: 'lowpass', cutoff: character === 'pluck' ? 2600 : 7000, res: 0.7, envAmt: character === 'pluck' ? 1.6 : character === 'texture' ? 1 : 0.3, keyTrack: 0.5 },
+    fenv: { a: 0.012, d: character === 'pluck' ? 0.25 : 0.6, s: 0.2, r: 0.4 },
     amp: { a: unit.attack(v('attack')), d: amp.d, s: amp.s, r: unit.release(v('release')) },
     lfo: { rate: 0.5, depth: 0, dest: 'none' },
     poly: character === 'drone' ? 6 : character === 'texture' ? 12 : 8,
@@ -181,22 +191,33 @@ export function deriveImageSynth(name: string, character: SynthCharacter, f: Reg
   });
 }
 
-const cv01 = (cv: Curve, key: FeatureKey, t: number) => (key === 'none' ? 0.5 : curveValue(cv, key as CurveKey, t));
+const cv01 = (cv: Curve, key: FeatureKey, t: number) => (key === 'none' ? 0.5 : norm(key, curveValue(cv, key as CurveKey, t)));
 
 /** Value of one mapping along the scan: static + EVOLUTION × (deviation from the region's mean). */
 export function mappingCurve(m: SynthMapping, character: SynthCharacter, cv: Curve, evolution: number, s: RegionFeatures['summary']): (t01: number) => number {
   const n = NEUTRAL[character][m.target] ?? 0.5;
   const mean = featMean(s, m.source);
   const meanCv = m.source === 'centroid' ? (() => { let a = 0; for (let j = 0; j < cv.n; j++) a += cv.centroid[j]; return a / cv.n; })() : mean;
+  // temporal movement follows the image's own pattern of change, scaled to its range along the
+  // scan (a gentle haze still breathes; the floor keeps a featureless frame still)
+  let lo = Infinity, hi = -Infinity;
+  if (m.source !== 'none') for (let j = 0; j < 64; j++) { const v = cv01(cv, m.source, j / 63); lo = Math.min(lo, v); hi = Math.max(hi, v); }
+  const range = Math.max(0.12, hi - lo);
+  const base = logit(n) + m.amount * 3 * (mean - 0.5);
   return (t01) => {
     if (m.source === 'none') return n;
     const f = cv01(cv, m.source, t01);
-    return c01(n + m.amount * (0.9 * (mean - 0.5) + 1.8 * evolution * (f - meanCv)));
+    // (f − mean) / (range / 2) spans about ±1 across the scan
+    return logistic(base + m.amount * evolution * 2 * ((f - meanCv) / (range / 2)));
   };
 }
 
 /** Automation lanes for every 'lane' and 'note' target. At EVOLUTION 0 each lane is flat (a static,
  *  repeatable timbre); otherwise it follows the feature, smoothed so filters never jump. */
+/** Ceilings for targets that become unpleasant or rhythmic at full scale: high delay feedback
+ *  turns an echo into a pulse train, very high resonance whistles. */
+const CEILING: Partial<Record<SynthTarget, number>> = { delayFeedback: 0.55, resonance: 0.7 };
+
 export function synthLanes(cv: Curve, map: SynthMapping[], character: SynthCharacter, f: RegionFeatures, evolution: number, beats: number, idPrefix: string, origin: AutomationLane['origin'], skip: SynthTarget[] = []): AutomationLane[] {
   const step = Math.max(0.5, beats / 512);
   const lanes: AutomationLane[] = [];
@@ -204,8 +225,9 @@ export function synthLanes(cv: Curve, map: SynthMapping[], character: SynthChara
     const def = SYNTH_TARGETS[m.target];
     if (def.kind === 'gen' || !def.mod || skip.includes(m.target)) continue;
     const fn = mappingCurve(m, character, cv, evolution, f.summary);
+    const ceil = CEILING[m.target] ?? 1;
     const vals: number[] = [];
-    for (let b = 0; b <= beats + 1e-6; b += step) vals.push(fn(b / beats));
+    for (let b = 0; b <= beats + 1e-6; b += step) vals.push(Math.min(ceil, fn(b / beats)));
     // forward-backward slew: smooth without shifting features in time
     const a = 0.45;
     for (let i = 1; i < vals.length; i++) vals[i] = vals[i - 1] + a * (vals[i] - vals[i - 1]);

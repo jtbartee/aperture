@@ -17,6 +17,8 @@ export interface ContourDrawOpts {
   alpha?: number;
   /** contour ids that are sounding now (drawn bold) */
   active?: Set<string>;
+  /** contour ids that have notes; others are drawn faint and dashed (detected but silent) */
+  voiced?: Set<string>;
   junctions?: boolean;
   /** only draw where canvas x is within this range (panorama viewport) */
   clip?: [number, number];
@@ -30,13 +32,16 @@ export function drawContours(ctx: CanvasRenderingContext2D, set: ContourSet, o: 
     const xs = c.pts.map((p) => o.X(p.x));
     if (o.clip && (Math.max(...xs) < o.clip[0] || Math.min(...xs) > o.clip[1])) continue;
     const on = o.active?.has(c.id);
+    const silent = o.voiced && !o.voiced.has(c.id);
     const pts = catmullRom(c.pts, step, c.closed, o.sy / Math.max(1, o.sx));
-    ctx.strokeStyle = contourColor(c.rank, on ? 1 : o.alpha ?? 0.9);
+    ctx.strokeStyle = contourColor(c.rank, on ? 1 : silent ? 0.4 : o.alpha ?? 0.9);
     ctx.lineWidth = (o.width ?? 1.8) * (on ? 2 : 1);
+    ctx.setLineDash(silent ? [5, 4] : []);
     ctx.beginPath();
     pts.forEach((p, i) => (i ? ctx.lineTo(o.X(p.x), o.Y(p.y)) : ctx.moveTo(o.X(p.x), o.Y(p.y))));
     if (c.closed) ctx.closePath();
     ctx.stroke();
+    ctx.setLineDash([]);
     if (c.parent !== undefined) {
       // branch start: a small open circle where it leaves its parent
       const p0 = c.pts[0];

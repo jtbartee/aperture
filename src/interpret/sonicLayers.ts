@@ -43,7 +43,10 @@ export function voiceSound(ctx: SonicContext, l: LayerOutput, character: SynthCh
   const f = regionFeatures(ctx.grid, mask, cv);
   l.patch = deriveImageSynth(`Image Synth · ${l.name}`, character, f, ctx.shape.synthMap);
   l.automation = [...l.automation, ...synthLanes(cv, ctx.shape.synthMap, character, f, ctx.shape.evolution, ctx.beats, l.key.replace(/[^a-z0-9]+/gi, '_'), ctx.origin)];
-  if (!(l.fx ?? []).some((x) => x.type === 'pingpong' || x.type === 'delay')) l.fx = [...(l.fx ?? []), fxSlot('pingpong', { wet: character === 'drone' ? 0.12 : 0.2, feedback: 0.3 }, `fx_${l.key.replace(/[^a-z0-9]+/gi, '_')}_pp`)];
+  // echo times per character, deliberately unrelated to the tempo: a free-time piece should not
+  // acquire a pulse through its delay line
+  const time = { drone: 0.61, voice: 0.43, pluck: 0.37, shimmer: 0.53, texture: 0.29 }[character];
+  if (!(l.fx ?? []).some((x) => x.type === 'pingpong' || x.type === 'delay')) l.fx = [...(l.fx ?? []), fxSlot('pingpong', { time, wet: character === 'drone' ? 0.12 : 0.2, feedback: 0.3 }, `fx_${l.key.replace(/[^a-z0-9]+/gi, '_')}_pp`)];
 }
 
 const meanY = (c: Contour) => c.pts.reduce((a, p) => a + p.y, 0) / Math.max(1, c.pts.length);
@@ -62,7 +65,11 @@ export function contourVoiceSpecs(ctx: SonicContext, mode: 'rank' | 'register', 
     .map((c) => ({ c, w: c.length * (0.4 + c.intensity) * (1 + freedom * (r() - 0.5)) }))
     .sort((a, b) => b.w - a.w)
     .map((x) => x.c);
-  const chosen = all.slice(0, contourCount(all.length, ctx.density));
+  // density thins out minor detail; it never silences a major contour (≥ half the strongest)
+  const sal = (c: Contour) => c.length * (0.4 + c.intensity);
+  const top = all.length ? sal(all[0]) : 0;
+  const major = Math.min(3, all.filter((c) => sal(c) >= top * 0.5).length);
+  const chosen = all.slice(0, Math.max(major, contourCount(all.length, ctx.density)));
   if (!chosen.length) return [];
   if (mode === 'rank') {
     const groups: Contour[][] = [[], [], [], []];
@@ -193,7 +200,7 @@ export function rhythmLayer(ctx: SonicContext, key: string, metricKey: string): 
     const timed = timedEvents(ev, ctx.segs, ctx.beats, (t) => gap / dmod(t));
     if (!timed.length) return null;
     const l = layer(key, 'Image texture → micro-events', 'texture', ctx.origin === 'image' ? 'imageTexture' : 'panorama', { color: '#9ad0c9', mix: { volume: -9, reverb: 0.25, delay: 0.2 } });
-    l.patch = instrument('Microclicks');
+    l.patch = instrument('Glitch Percussion');
     const KIND: Record<string, number> = { accent: 0, grain: 1, pulse: 2, click: 3 };
     l.notes = timed.map((e, k) => {
       const base = Math.round(48 + e.y * 44);

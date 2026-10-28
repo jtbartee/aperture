@@ -77,9 +77,9 @@ export function PanoramaView() {
     if (lv) ctx.drawImage(lv.display, -off, imgTop, dw, dh);
     const X = (x: number) => x * dw - off;
     const Yimg = (y: number) => imgTop + y * dh; // y: 0 = top of image
-    // regions
+    // regions (only when the classic region roles are in use, or while painting one)
     for (const r of src.regions) {
-      if (!r.enabled) continue;
+      if (!r.enabled || (!src.settings.layers?.regions && u.paintRegionId !== r.id)) continue;
       const col = ROLE_COLOR[r.role] ?? '#fff';
       if (r.mask) {
         ctx.fillStyle = hexA(col, u.paintRegionId === r.id ? 0.35 : 0.16);
@@ -107,13 +107,17 @@ export function PanoramaView() {
     // contours under the scan, sounding ones bold
     const pos = engine.position();
     const active = new Set<string>();
+    const voiced = new Set<string>();
     let sounding = 0;
     for (const tr of p.tracks) {
       if (!tr.generator?.startsWith('pano:') || tr.mix.mute) continue;
-      for (const n of tr.notes) if (n.start <= pos && n.start + n.dur > pos) { sounding++; if (n.cid) active.add(n.cid); }
+      for (const n of tr.notes) {
+        if (n.cid) voiced.add(n.cid);
+        if (n.start <= pos && n.start + n.dur > pos) { sounding++; if (n.cid) active.add(n.cid); }
+      }
     }
     const an = getAnalysis(src.asset.assetId);
-    if (an && showContours) drawContours(ctx, an.contours, { X, Y: (y) => Yimg(1 - y), sx: dw, sy: dh, active, junctions: false, clip: [-20, w + 20], alpha: 0.75 });
+    if (an && showContours) drawContours(ctx, an.contours, { X, Y: (y) => Yimg(1 - y), sx: dw, sy: dh, active, voiced, junctions: false, clip: [-20, w + 20], alpha: 0.75 });
     // notes overlay: contour notes sit at the image point they were read from; region notes inside
     // the region's vertical extent — all through the same scan mapping as the view
     for (const tr of p.tracks) {

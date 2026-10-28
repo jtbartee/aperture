@@ -15,10 +15,10 @@ export type FactoryId = 'geometry' | 'haze' | 'motorik' | 'fragmented' | 'panora
 
 export const FACTORY: { id: FactoryId; name: string; mode: string; style: string; description: string }[] = [
   { id: 'geometry', name: 'Geometry in Motion', mode: 'Draw', style: 'Minimal electronic', description: 'Rectangles hold drones, an ellipse arpeggiates, lines rise into phrases, dot rows become rhythm.' },
-  { id: 'haze', name: 'Infinite Haze', mode: 'Image', style: 'Ambient drone', description: 'A generated luminous haze read atmospherically: colour sets the chords, light the drones.' },
+  { id: 'haze', name: 'Infinite Haze', mode: 'Image', style: 'Ambient drone', description: 'A generated luminous haze read atmospherically: colour sets the chords, light opens the Image Synth drone as the scan passes the glows.' },
   { id: 'motorik', name: 'Motorik Machine', mode: 'Generative', style: 'Krautrock', description: 'A locked pulse, eighth-note bass and arpeggios that mutate and open up over 64 bars.' },
   { id: 'fragmented', name: 'Fragmented Signals', mode: 'Generative', style: 'IDM / glitch in 7/8', description: 'Changing subdivisions, stutters and polymetric layers (7- and 13-step patterns).' },
-  { id: 'panorama', name: 'Panoramic Journey', mode: 'Panorama', style: 'Ambient / cinematic', description: 'A generated six-zone landscape scrolls for four minutes; each zone changes the music.' },
+  { id: 'panorama', name: 'Panoramic Journey', mode: 'Panorama', style: 'Ambient / cinematic', description: 'A generated six-zone landscape scrolls for four minutes: the ridgelines sing as contour voices over an evolving image-synth drone, and each zone changes the timbre.' },
 ];
 
 function stroke(trackId: string, points: { x: number; y: number }[], brush: Partial<Stroke['brush']>, shape: Stroke['shape'] = 'freehand', id: string): Stroke {
@@ -106,12 +106,10 @@ export async function loadFactory(id: FactoryId) {
       st.toast('Painting a 4800-pixel landscape…', 'info');
       await new Promise((r) => setTimeout(r, 30));
       const blob = await rgbaToPng(panoramaLandscape(4800, 900, 7));
-      await useStore.getState().importImage(blob, 'panoramic-journey.png', 'panorama', { timing: 'free', seconds: 240, scanResolution: 384, density: 0.45, threshold: 0.5, seed: 2 });
+      await useStore.getState().importImage(blob, 'panoramic-journey.png', 'panorama', { timing: 'free', seconds: 240, scanResolution: 384, density: 0.42, evolution: 0.85, seed: 2 });
+      // the classic region roles stay configured (switch them on under Sonification layers)
       const s = useStore.getState();
-      if (s.project.panorama) {
-        s.setRegions(defaultRegions().map((r) => ({ ...r, enabled: true })), false);
-        s.generatePanorama();
-      }
+      if (s.project.panorama) s.setRegions(defaultRegions().map((r) => ({ ...r, enabled: true })), false);
       break;
     }
   }
