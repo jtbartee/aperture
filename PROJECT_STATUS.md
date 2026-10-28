@@ -1,6 +1,6 @@
 # APERTURE — project status
 
-Last updated: 2026-10-27. Repository: `spectral-atlas` (Vite base `/spectral-atlas/`).
+Last updated: 2026-10-27. Repository: `aperture` (Vite base `/aperture/`).
 
 Legend: ✅ complete and tested · 🟡 implemented, needs more testing · 🚧 in progress · ⬜ not started
 

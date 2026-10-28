@@ -1,9 +1,9 @@
 import { defineConfig } from 'vitest/config';
 import react from '@vitejs/plugin-react';
 
-// GitHub Pages serves the project site from /spectral-atlas/; preview mirrors it.
+// GitHub Pages serves the project site from /aperture/; preview mirrors it.
 export default defineConfig(({ command, isPreview }) => ({
-  base: command === 'build' || isPreview ? '/spectral-atlas/' : '/',
+  base: command === 'build' || isPreview ? '/aperture/' : '/',
   plugins: [react()],
   worker: { format: 'es' },
   build: {

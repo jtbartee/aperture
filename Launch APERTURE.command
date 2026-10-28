@@ -2,7 +2,7 @@
 # Starts APERTURE locally and opens it in your browser.
 cd "$(dirname "$0")"
 PORT=8772
-URL="http://localhost:$PORT/spectral-atlas/"
+URL="http://localhost:$PORT/aperture/"
 if ! command -v npm >/dev/null; then echo "Node.js is required: https://nodejs.org"; read -n 1; exit 1; fi
 [ -d node_modules ] || npm install
 [ -d dist ] || npm run build

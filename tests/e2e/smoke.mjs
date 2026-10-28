@@ -5,7 +5,7 @@ import { mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 const PORT = 8771;
-const BASE = `http://localhost:${PORT}/spectral-atlas/`;
+const BASE = `http://localhost:${PORT}/aperture/`;
 const OUT = new URL('./out/', import.meta.url).pathname;
 mkdirSync(OUT, { recursive: true });
 const server = spawn('npx', ['vite', 'preview', '--port', String(PORT), '--strictPort'], { stdio: 'ignore' });

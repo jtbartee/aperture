@@ -13,7 +13,7 @@ const { Midi } = midiPkg;
 import { unzipSync } from 'fflate';
 
 const PORT = 8771;
-const BASE = `http://localhost:${PORT}/spectral-atlas/`;
+const BASE = `http://localhost:${PORT}/aperture/`;
 const OUT = new URL('./out/', import.meta.url).pathname;
 mkdirSync(OUT, { recursive: true });
 const ONLY = process.argv.slice(2);

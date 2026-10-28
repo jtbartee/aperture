@@ -3,7 +3,7 @@
 **Draw it, photograph it, or scan a panorama — and hear it.**
 APERTURE is a visual music composition, image-sonification and generative-synthesis workstation that runs entirely in your browser. No account, no uploads, no paid services.
 
-Live: **https://jtbartee.github.io/spectral-atlas/**
+Live: **https://jtbartee.github.io/aperture/**
 
 The image is the score. Everything you draw, import or generate becomes ordinary, editable note events on layers, and those same events drive live playback, the offline WAV renderer and MIDI export.
 
@@ -35,7 +35,7 @@ Projects autosave to IndexedDB in your browser. **Clearing site data deletes the
 npm install
 npm run dev        # development server
 npm run build      # type-check + production build into dist/
-npm run preview    # serve the build at http://localhost:4173/spectral-atlas/
+npm run preview    # serve the build at http://localhost:4173/aperture/
 ```
 
 On macOS you can double-click **Launch APERTURE.command** (serves the build on port 8772 and opens it once it is confirmed to be this app).

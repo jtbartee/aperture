@@ -1,5 +1,5 @@
 {
-  "name": "spectral-atlas",
+  "name": "aperture",
   "private": true,
   "version": "0.1.0",
   "description": "APERTURE: a visual music composition, image sonification and generative synthesis workstation that runs entirely in the browser",
